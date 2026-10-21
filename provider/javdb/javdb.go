@@ -160,7 +160,11 @@ func (jav *JavDB) SearchMovie(keyword string) ([]*model.MovieSearchResult, error
 	if keyword == "" {
 		return nil, provider.ErrInvalidKeyword
 	}
-	return jav.searchMovie(keyword)
+	results, err := jav.searchMovie(keyword)
+	if err != nil {
+		return nil, err
+	}
+	return jav.filterSearchResults(results, keyword), nil
 }
 
 func (jav *JavDB) searchMovie(keyword string) ([]*model.MovieSearchResult, error) {
@@ -169,6 +173,17 @@ func (jav *JavDB) searchMovie(keyword string) ([]*model.MovieSearchResult, error
 		return nil, err
 	}
 	return jav.parseSearchResults(body)
+}
+
+func (jav *JavDB) filterSearchResults(results []*model.MovieSearchResult, keyword string) []*model.MovieSearchResult {
+	filtered := make([]*model.MovieSearchResult, 0, len(results))
+	for _, result := range results {
+		if result == nil || !strings.EqualFold(jav.NormalizeMovieKeyword(result.Number), keyword) {
+			continue
+		}
+		filtered = append(filtered, result)
+	}
+	return filtered
 }
 
 func (jav *JavDB) getMovieInfoByNumber(n string) (*model.MovieInfo, error) {
@@ -181,10 +196,7 @@ func (jav *JavDB) getMovieInfoByNumber(n string) (*model.MovieInfo, error) {
 		return nil, err
 	}
 
-	for _, result := range results {
-		if !strings.EqualFold(jav.NormalizeMovieKeyword(result.Number), keyword) {
-			continue
-		}
+	for _, result := range jav.filterSearchResults(results, keyword) {
 		// FC2 detail pages often require a login. Keep using the complete public
 		// search card for the legacy FC2 path while normal titles get full details.
 		if fc2ID := fc2util.ParseNumber(result.Number); fc2ID != "" {

@@ -103,13 +103,27 @@ func TestJavDB_SearchMovie(t *testing.T) {
 	})
 	results, err := jav.SearchMovie("sone-065.mkv")
 	require.NoError(t, err)
-	require.Len(t, results, 2)
+	require.Len(t, results, 1)
 	assert.Equal(t, "AbC123", results[0].ID)
 	assert.Equal(t, "SONE-065", results[0].Number)
 	assert.Equal(t, "Example title", results[0].Title)
 	assert.Equal(t, jav.URL().String()+"/v/AbC123", results[0].Homepage)
 	assert.Equal(t, jav.URL().String()+"/cover.jpg", results[0].CoverURL)
 	assert.True(t, results[0].IsValid())
+}
+
+func TestJavDB_SearchMovieFiltersRelatedNumbers(t *testing.T) {
+	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "MUKD-502", r.URL.Query().Get("q"))
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("related1", "MUKD-552", "Related 552", "/related1.jpg")+
+			card("related2", "MUKD-542", "Related 542", "/related2.jpg")+
+			card("related3", "MUKD-532", "Related 532", "/related3.jpg")+`</div>`)
+	})
+
+	results, err := jav.SearchMovie("MUKD-502")
+	require.NoError(t, err)
+	assert.Empty(t, results)
 }
 
 func TestJavDB_NumberLookupFetchesDetailPage(t *testing.T) {
