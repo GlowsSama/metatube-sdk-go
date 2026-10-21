@@ -196,15 +196,18 @@ func (jav *JavDB) getMovieInfoByNumber(n string) (*model.MovieInfo, error) {
 		return nil, err
 	}
 
-	for _, result := range jav.filterSearchResults(results, keyword) {
-		// FC2 detail pages often require a login. Keep using the complete public
-		// search card for the legacy FC2 path while normal titles get full details.
-		if fc2ID := fc2util.ParseNumber(result.Number); fc2ID != "" {
-			return searchResultToInfo(result), nil
-		}
-		return jav.getMovieInfoByDetailURL(result.Homepage, result.ID)
+	filtered := jav.filterSearchResults(results, keyword)
+	if len(filtered) == 0 {
+		return nil, provider.ErrInfoNotFound
 	}
-	return nil, provider.ErrInfoNotFound
+
+	result := filtered[0]
+	// FC2 detail pages often require a login. Keep using the complete public
+	// search card for the legacy FC2 path while normal titles get full details.
+	if fc2ID := fc2util.ParseNumber(result.Number); fc2ID != "" {
+		return searchResultToInfo(result), nil
+	}
+	return jav.getMovieInfoByDetailURL(result.Homepage, result.ID)
 }
 
 func (jav *JavDB) getMovieInfoByDetailURL(rawURL, id string) (*model.MovieInfo, error) {
