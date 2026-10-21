@@ -9,6 +9,9 @@ on:
     tags:
       - '*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build
@@ -45,5 +48,3 @@ jobs:
           files: build/*
           draft: false
           prerelease: false
-          repository: metatube-community/metatube-server-releases
-          token: ${{ secrets.ORG_PAT }}
