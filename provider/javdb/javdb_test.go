@@ -265,6 +265,17 @@ func TestJavDB_MissingOrIncompleteMetadata(t *testing.T) {
 				assert.ErrorIs(t, err, errAntiBotChallenge)
 			},
 		},
+		{
+			name: "anti-bot challenge with 403",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, `<html><title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/x"></script></html>`)
+			},
+			call: func(j *JavDB) (*model.MovieInfo, error) { return j.GetMovieInfoByID("wKg2O2") },
+			assert: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, errAntiBotChallenge)
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			jav := newTestProvider(t, tc.handler)
@@ -406,5 +417,8 @@ func TestJavDB_LiveFlareSolverr(t *testing.T) {
 }
 
 func TestJavDB_GetMovieInfoByID(t *testing.T) {
+	if os.Getenv("METATUBE_TEST_JAVDB") == "" {
+		t.Skip("METATUBE_TEST_JAVDB is not set")
+	}
 	testkit.Test(t, New, []string{"SONE-065"})
 }

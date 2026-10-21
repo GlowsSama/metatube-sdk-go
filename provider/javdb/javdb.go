@@ -214,23 +214,29 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 		body = append([]byte(nil), r.Body...)
 	})
 	c.OnError(func(r *colly.Response, err error) {
+		if len(r.Body) > 0 {
+			body = append([]byte(nil), r.Body...)
+		}
 		responseErr = fmt.Errorf("%s: request failed with HTTP %d: %w", jav.Name(), r.StatusCode, err)
 	})
 
-	if err := c.Visit(rawURL); err != nil {
+	visitErr := c.Visit(rawURL)
+	if len(body) > 0 {
+		if err := detectPageError(body); err != nil {
+			return nil, err
+		}
+	}
+	if visitErr != nil {
 		if responseErr != nil {
 			return nil, responseErr
 		}
-		return nil, err
+		return nil, visitErr
 	}
 	if responseErr != nil {
 		return nil, responseErr
 	}
 	if len(body) == 0 {
 		return nil, fmt.Errorf("%s: empty response", jav.Name())
-	}
-	if err := detectPageError(body); err != nil {
-		return nil, err
 	}
 	return body, nil
 }
