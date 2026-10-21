@@ -36,12 +36,16 @@ Metadata Tube SDK in Golang.
 - 20+ providers
 - Text translation
 
-`JavDB` provides basic FC2 metadata from public search results as a lower-priority
-alternative to `FC2`, `fc2hub`, and `FC2PPVDB`. It matches the exact FC2 number and
-provides the title, cover, release date, and rating without requiring a login.
-Actor names and other detail-page fields are not available through this provider.
-Its IDs are numeric FC2 IDs; supported URLs are public search URLs such as
-`https://javdb.com/search?q=FC2-3119569&f=all`.
+`JavDB` supports public number searches and detail-page metadata, including title,
+cover, release date, runtime, rating, director, maker, label, series, genres,
+actors, and preview images. Standard numbers such as `SONE-065` are searched and
+then resolved through their detail page. Opaque detail-page IDs keep JavDB's
+original case, for example `https://javdb.com/v/wKg2O2`.
+
+FC2 numbers remain supported through public search results and keep numeric IDs
+for backward compatibility, for example
+`https://javdb.com/search?q=FC2-3119569&f=all`. FC2 detail pages that require a
+login use the public search card instead.
 
 ## FlareSolverr
 
