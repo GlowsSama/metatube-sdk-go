@@ -97,6 +97,11 @@ type ProxySetter interface {
 	SetProxy(proxyURL string) error
 }
 
+type FlareSolverrSetter interface {
+	// SetFlareSolverr sets the FlareSolverr API endpoint for HTTP requests.
+	SetFlareSolverr(endpoint string) error
+}
+
 type Config interface {
 	Has(string) bool
 	GetString(string) (string, error)

@@ -82,9 +82,10 @@ func (e *Engine) initMovieProviders() {
 
 func (e *Engine) applyProviderConfig(providerType string, provider mt.Provider, config mt.Config) {
 	const (
-		proxyConfigKey    = "proxy"
-		priorityConfigKey = "priority"
-		timeoutConfigKey  = "timeout"
+		flareSolverrConfigKey = "flaresolverr"
+		proxyConfigKey        = "proxy"
+		priorityConfigKey     = "priority"
+		timeoutConfigKey      = "timeout"
 	)
 
 	// Apply overridden priority.
@@ -102,6 +103,16 @@ func (e *Engine) applyProviderConfig(providerType string, provider mt.Provider, 
 				e.logger.Fatalf("Set proxy for %s provider '%s' error: %v", providerType, provider.Name(), v)
 			}
 			e.logger.Printf("Override %s provider proxy: %s=%s", providerType, provider.Name(), v)
+		}
+	}
+
+	// Apply Cloudflare challenge solving.
+	if s, ok := provider.(mt.FlareSolverrSetter); ok && config.Has(flareSolverrConfigKey) {
+		if v, err := config.GetString(flareSolverrConfigKey); err == nil {
+			if err := s.SetFlareSolverr(v); err != nil {
+				e.logger.Fatalf("Set FlareSolverr for %s provider '%s' error: %v", providerType, provider.Name(), err)
+			}
+			e.logger.Printf("Configure %s provider FlareSolverr: %s=%s", providerType, provider.Name(), v)
 		}
 	}
 

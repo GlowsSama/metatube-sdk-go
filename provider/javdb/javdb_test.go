@@ -1,11 +1,13 @@
 package javdb
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -178,6 +180,55 @@ func TestJavDB_ConcurrentLookups(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestJavDB_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cf-Mitigated", "challenge")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(target.Close)
+
+	flare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			URL string `json:"url"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		assert.Contains(t, payload.URL, "/search?")
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"solution": map[string]any{
+				"status":   http.StatusOK,
+				"response": `<div class="movie-list">` + card("FC2-3119569", "Solved title", "/solved.jpg") + `</div>`,
+			},
+		}))
+	}))
+	t.Cleanup(flare.Close)
+
+	jav := New()
+	jav.Scraper = scraper.NewDefaultScraper(Name, target.URL, Priority, language.Japanese)
+	require.NoError(t, jav.SetFlareSolverr(flare.URL+"/v1"))
+
+	info, err := jav.GetMovieInfoByID("3119569")
+	require.NoError(t, err)
+	assert.Equal(t, "Solved title", info.Title)
+	assert.Equal(t, target.URL+"/solved.jpg", info.CoverURL)
+}
+
+func TestJavDB_LiveFlareSolverr(t *testing.T) {
+	endpoint := os.Getenv("METATUBE_TEST_FLARESOLVERR")
+	if endpoint == "" {
+		t.Skip("METATUBE_TEST_FLARESOLVERR is not set")
+	}
+
+	jav := New()
+	jav.SetRequestTimeout(2 * time.Minute)
+	require.NoError(t, jav.SetFlareSolverr(endpoint))
+
+	info, err := jav.GetMovieInfoByID("3119569")
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	assert.True(t, info.IsValid())
 }
 
 func TestJavDB_GetMovieInfoByID(t *testing.T) {

@@ -43,6 +43,25 @@ Actor names and other detail-page fields are not available through this provider
 Its IDs are numeric FC2 IDs; supported URLs are public search URLs such as
 `https://javdb.com/search?q=FC2-3119569&f=all`.
 
+## FlareSolverr
+
+Providers backed by the shared Colly scraper can use a
+[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) endpoint to solve
+Cloudflare challenges. Requests are attempted directly first; FlareSolverr is
+only called for Cloudflare challenge responses.
+
+For example, enable it for JavDB with:
+
+```sh
+MT_MOVIE_PROVIDER_JAVDB__FLARESOLVERR=http://192.168.1.10:8191/v1
+```
+
+`MT_PROVIDER_JAVDB__FLARESOLVERR` applies the same setting globally to both
+movie and actor providers. The endpoint may include or omit `/v1`. When both
+services run in Docker, use the FlareSolverr container's service name (for
+example `http://flaresolverr:8191/v1`) rather than `localhost`, which points
+back to the MetaTube container.
+
 ## Installation
 
 To install this package, you first need [Go](https://golang.org/) installed (**go1.25+ is required**), then you can use
