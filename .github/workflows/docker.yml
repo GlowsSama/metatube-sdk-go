@@ -8,6 +8,8 @@ on:
   push:
     branches:
       - 'main'
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -39,10 +41,33 @@ jobs:
         with:
           version: latest
 
-      - name: Generate image tag
+      - name: Generate image tags
         id: meta
         run: |
-          echo "tag=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          timestamp="$(date -u +'%Y%m%d-%H%M%S')"
+          echo "timestamp=${timestamp}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            {
+              echo "tags<<EOF"
+              echo "${IMAGE_NAME}:${GITHUB_REF_NAME}"
+              echo "${IMAGE_NAME}:${version}"
+              echo "${IMAGE_NAME}:latest"
+              echo "${IMAGE_NAME}:${timestamp}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "channel=latest" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "tags<<EOF"
+              echo "${IMAGE_NAME}:dev"
+              echo "${IMAGE_NAME}:${timestamp}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "channel=dev" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
@@ -58,8 +83,7 @@ jobs:
           file: Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -67,5 +91,14 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Record published image
+        env:
+          IMAGE_CHANNEL: ${{ steps.meta.outputs.channel }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          echo "Published \`${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Published \`${IMAGE_CHANNEL}\` image:"
+            echo
+            echo '```'
+            printf '%s\n' "${IMAGE_TAGS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
