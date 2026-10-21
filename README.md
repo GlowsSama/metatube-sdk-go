@@ -50,17 +50,25 @@ Providers backed by the shared Colly scraper can use a
 Cloudflare challenges. Requests are attempted directly first; FlareSolverr is
 only called for Cloudflare challenge responses.
 
-For example, enable it for JavDB with:
+The recommended setup is to enter the FlareSolverr endpoint in the MetaTube
+Jellyfin/Emby plugin configuration. The plugin synchronizes it with the server
+before metadata and image requests, including after a server restart. Leave the
+field empty to disable FlareSolverr.
+
+The endpoint may include or omit `/v1`. When both services run in Docker, use
+the FlareSolverr container's service name (for example
+`http://flaresolverr:8191/v1`) rather than `localhost`, which points back to the
+MetaTube container.
+
+Server environment variables can still provide an initial configuration:
 
 ```sh
 MT_MOVIE_PROVIDER_JAVDB__FLARESOLVERR=http://192.168.1.10:8191/v1
 ```
 
 `MT_PROVIDER_JAVDB__FLARESOLVERR` applies the same setting globally to both
-movie and actor providers. The endpoint may include or omit `/v1`. When both
-services run in Docker, use the FlareSolverr container's service name (for
-example `http://flaresolverr:8191/v1`) rather than `localhost`, which points
-back to the MetaTube container.
+movie and actor providers. A setting synchronized by the plugin takes effect at
+runtime and overrides the startup value.
 
 ## Installation
 

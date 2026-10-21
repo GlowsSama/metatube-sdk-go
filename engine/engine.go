@@ -6,6 +6,7 @@ import (
 	gomaps "maps"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -146,6 +147,52 @@ func (e *Engine) MustGetMovieProviderByName(name string) mt.MovieProvider {
 		panic(err)
 	}
 	return provider
+}
+
+// SetFlareSolverr configures FlareSolverr for every provider that supports it.
+// An empty endpoint disables FlareSolverr. It returns the configured provider names.
+func (e *Engine) SetFlareSolverr(endpoint string) ([]string, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	providers := make([]mt.Provider, 0,
+		len(e.GetActorProviders())+len(e.GetMovieProviders()))
+	for _, provider := range e.GetActorProviders() {
+		providers = append(providers, provider)
+	}
+	for _, provider := range e.GetMovieProviders() {
+		providers = append(providers, provider)
+	}
+
+	configured := make([]string, 0, len(providers))
+	failures := make([]string, 0)
+	for _, provider := range providers {
+		setter, ok := provider.(mt.FlareSolverrSetter)
+		if !ok {
+			continue
+		}
+		if err := setter.SetFlareSolverr(endpoint); err != nil {
+			failures = append(failures,
+				fmt.Sprintf("%s: %v", provider.Name(), err))
+			continue
+		}
+		configured = append(configured, provider.Name())
+	}
+	sort.Strings(configured)
+
+	if len(failures) > 0 {
+		return configured, fmt.Errorf("configure FlareSolverr: %s",
+			strings.Join(failures, "; "))
+	}
+	if len(configured) == 0 {
+		return nil, fmt.Errorf("no providers support FlareSolverr")
+	}
+
+	if endpoint == "" {
+		e.logger.Printf("Disabled FlareSolverr for %d providers", len(configured))
+	} else {
+		e.logger.Printf("Configured FlareSolverr for %d providers: %s",
+			len(configured), endpoint)
+	}
+	return configured, nil
 }
 
 // Fetch fetches content from url. If the provider

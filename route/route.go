@@ -56,6 +56,11 @@ func New(app *engine.Engine, v auth.Validator) *gin.Engine {
 
 	private := r.Group("/v1", authentication(v))
 	{
+		config := private.Group("/config")
+		{
+			config.PUT("/flaresolverr", setFlareSolverr(app))
+		}
+
 		db := private.Group("/db")
 		{
 			db.GET("/version", getDBVersion(app))
