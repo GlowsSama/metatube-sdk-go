@@ -1,6 +1,8 @@
 package javbus
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -38,6 +40,12 @@ const (
 	searchUncensoredURL = "https://www.javbus.com/ja/uncensored/search/%s"
 )
 
+var (
+	errVerificationRequired = errors.New("JavBus age verification required")
+	labelNumberRe           = regexp.MustCompile(`(?i)^([a-z]{2,})(\d+)$`)
+	specialMovieRe          = regexp.MustCompile(`^(?i)([\d-_]{4,}|[a-z]{1,4}\d{2,4}|heyzo[-_].+)$`)
+)
+
 type JavBus struct {
 	*fetch.Fetcher
 	*scraper.Scraper
@@ -57,12 +65,14 @@ func New() *JavBus {
 				// existmag=all
 				{Name: "dv", Value: "1"},
 				{Name: "existmag", Value: "all"},
+				// age verification
+				{Name: "age", Value: "verified"},
 			})),
 	}
 }
 
 func (bus *JavBus) NormalizeMovieID(id string) string {
-	return strings.ToUpper(id)
+	return strings.ToUpper(labelNumberRe.ReplaceAllString(id, "${1}-${2}"))
 }
 
 func (bus *JavBus) GetMovieInfoByID(id string) (info *model.MovieInfo, err error) {
@@ -94,6 +104,12 @@ func (bus *JavBus) GetMovieInfoByURL(rawURL string) (info *model.MovieInfo, err 
 
 	c := bus.ClonedCollector()
 
+	c.OnResponse(func(r *colly.Response) {
+		if isVerificationResponse(r) {
+			err = errVerificationRequired
+		}
+	})
+
 	// Image+Title
 	c.OnXML(`//a[@class="bigImage"]/img`, func(e *colly.XMLElement) {
 		info.Title = e.Attr("title")
@@ -103,21 +119,21 @@ func (bus *JavBus) GetMovieInfoByURL(rawURL string) (info *model.MovieInfo, err 
 	// Fields
 	c.OnXML(`//div[@class="col-md-3 info"]/p`, func(e *colly.XMLElement) {
 		switch e.ChildText(`.//span`) {
-		case "品番:":
+		case "品番:", "ID:":
 			info.Number = e.ChildText(`.//span[2]`)
-		case "発売日:":
+		case "発売日:", "Release Date:":
 			fields := strings.Fields(e.Text)
 			info.ReleaseDate = parser.ParseDate(fields[len(fields)-1])
-		case "収録時間:":
+		case "収録時間:", "Length:":
 			fields := strings.Fields(e.Text)
 			info.Runtime = parser.ParseRuntime(fields[len(fields)-1])
-		case "監督:":
+		case "監督:", "Director:":
 			info.Director = e.ChildText(`.//a`)
-		case "メーカー:":
+		case "メーカー:", "Studio:":
 			info.Maker = e.ChildText(`.//a`)
-		case "レーベル:":
+		case "レーベル:", "Label:":
 			info.Label = e.ChildText(`.//a`)
-		case "シリーズ:":
+		case "シリーズ:", "Series:":
 			info.Series = e.ChildText(`.//a`)
 		}
 	})
@@ -162,15 +178,21 @@ func (bus *JavBus) GetMovieInfoByURL(rawURL string) (info *model.MovieInfo, err 
 		}
 	})
 
-	err = c.Visit(info.Homepage)
+	if visitErr := c.Visit(info.Homepage); visitErr != nil {
+		return nil, visitErr
+	}
+	if errors.Is(err, errVerificationRequired) {
+		return nil, err
+	}
 	return
 }
 
 func (bus *JavBus) NormalizeMovieKeyword(keyword string) string {
-	if number.IsSpecial(keyword) && !regexp.MustCompile(`^(?i)([\d-_]{4,}|[a-z]{1,4}\d{2,4}|heyzo[-_].+)$`).MatchString(keyword) {
+	keyword = strings.ToUpper(keyword)
+	if number.IsSpecial(keyword) && !specialMovieRe.MatchString(keyword) {
 		return "" // JavBus has no those special contents.
 	}
-	return strings.ToUpper(keyword)
+	return bus.NormalizeMovieID(keyword)
 }
 
 func (bus *JavBus) SearchMovie(keyword string) (results []*model.MovieSearchResult, err error) {
@@ -178,6 +200,14 @@ func (bus *JavBus) SearchMovie(keyword string) (results []*model.MovieSearchResu
 	c.Async = true /* ASYNC */
 
 	var mu sync.Mutex
+	var verificationRequired bool
+	c.OnResponse(func(r *colly.Response) {
+		if isVerificationResponse(r) {
+			mu.Lock()
+			verificationRequired = true
+			mu.Unlock()
+		}
+	})
 	c.OnXML(`//a[@class="movie-box"]`, func(e *colly.XMLElement) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -211,7 +241,29 @@ func (bus *JavBus) SearchMovie(keyword string) (results []*model.MovieSearchResu
 		}
 	}
 	c.Wait()
+
+	if verificationRequired {
+		return nil, errVerificationRequired
+	}
+
+	// JavBus search sometimes omits titles whose detail pages still exist.
+	if len(results) == 0 {
+		if id := bus.NormalizeMovieKeyword(keyword); id != "" {
+			if info, infoErr := bus.GetMovieInfoByID(id); errors.Is(infoErr, errVerificationRequired) {
+				return nil, infoErr
+			} else if infoErr == nil && info.IsValid() {
+				results = append(results, info.ToSearchResult())
+			}
+		}
+	}
 	return
+}
+
+func isVerificationResponse(r *colly.Response) bool {
+	return r.StatusCode >= http.StatusMultipleChoices &&
+		r.StatusCode < http.StatusBadRequest &&
+		strings.Contains(r.Headers.Get("Location"), "/doc/driver-verify") ||
+		bytes.Contains(r.Body, []byte(`id="ageVerify"`))
 }
 
 func init() {
