@@ -5,6 +5,7 @@ package engine
 import (
 	_ "github.com/metatube-community/metatube-sdk-go/provider/10musume"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/1pondo"
+	_ "github.com/metatube-community/metatube-sdk-go/provider/7mmtv"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/av-league"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/avbase"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/aventertainments"
