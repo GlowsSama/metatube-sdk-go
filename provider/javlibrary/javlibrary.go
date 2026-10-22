@@ -398,10 +398,7 @@ func cleanMovieTitle(title, number string) string {
 	}
 
 	cleaned := title
-	for {
-		if len(cleaned) < len(number) || !strings.EqualFold(cleaned[:len(number)], number) {
-			break
-		}
+	for len(cleaned) >= len(number) && strings.EqualFold(cleaned[:len(number)], number) {
 		rest := cleaned[len(number):]
 		if rest == "" {
 			return title
