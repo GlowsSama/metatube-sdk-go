@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/metatube-community/metatube-sdk-go/common/parser"
+	"github.com/metatube-community/metatube-sdk-go/model"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/testkit"
 )
 
@@ -53,6 +54,37 @@ func TestJavBus_Normalize(t *testing.T) {
 	} {
 		require.Equal(t, want, bus.NormalizeMovieID(id))
 	}
+}
+
+func TestJavBus_FilterSearchResults(t *testing.T) {
+	results := []*model.MovieSearchResult{
+		{
+			ID:       "ipz950",
+			Number:   "IPZ-950",
+			Title:    "Exact result",
+			Provider: Name,
+			Homepage: baseURL + "ja/ipz950",
+		},
+		{
+			ID:       "ipzz950",
+			Number:   "IPZZ-950",
+			Title:    "Related result",
+			Provider: Name,
+			Homepage: baseURL + "ja/ipzz950",
+		},
+		{
+			ID:       "ipz950",
+			Number:   "IPZ-950",
+			Title:    "Duplicate result",
+			Provider: Name,
+			Homepage: baseURL + "ja/ipz950",
+		},
+	}
+
+	filtered := New().filterSearchResults(results, "IPZ-950")
+	require.Len(t, filtered, 1)
+	require.Equal(t, "IPZ-950", filtered[0].Number)
+	require.Equal(t, "Exact result", filtered[0].Title)
 }
 
 func TestJavBus_GetMovieInfoByURL_English(t *testing.T) {

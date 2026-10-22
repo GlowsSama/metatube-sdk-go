@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gocolly/colly/v2"
@@ -227,7 +228,7 @@ func (m *MMTV) parseSearchResults(body []byte, keyword string) ([]*model.MovieSe
 		result := &model.MovieSearchResult{
 			ID:          id,
 			Number:      id,
-			Title:       cleanText(link.Text()),
+			Title:       cleanMovieTitle(link.Text(), id),
 			Provider:    m.Name(),
 			Homepage:    homepage,
 			ThumbURL:    cover,
@@ -235,7 +236,7 @@ func (m *MMTV) parseSearchResults(body []byte, keyword string) ([]*model.MovieSe
 			ReleaseDate: parser.ParseDate(item.Find(".video-info .text-muted").First().Text()),
 		}
 		if result.Title == "" {
-			result.Title = cleanText(firstAttr(link, "title"))
+			result.Title = cleanMovieTitle(firstAttr(link, "title"), id)
 		}
 		if !result.IsValid() {
 			return
@@ -269,7 +270,7 @@ func (m *MMTV) parseMovieInfo(body []byte, id, homepage string) (*model.MovieInf
 	info := &model.MovieInfo{
 		ID:            id,
 		Number:        id,
-		Title:         cleanText(doc.Find(".fullvideo-title").First().Text()),
+		Title:         cleanMovieTitle(doc.Find(".fullvideo-title").First().Text(), id),
 		Provider:      m.Name(),
 		Homepage:      homepage,
 		Actors:        []string{},
@@ -431,6 +432,36 @@ func firstAttr(selection *goquery.Selection, names ...string) string {
 
 func cleanText(value string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+}
+
+func cleanMovieTitle(title, id string) string {
+	title = cleanText(title)
+	id = cleanText(id)
+	if title == "" || id == "" {
+		return title
+	}
+
+	cleaned := title
+	for {
+		if len(cleaned) < len(id) || !strings.EqualFold(cleaned[:len(id)], id) {
+			break
+		}
+		rest := cleaned[len(id):]
+		if rest == "" {
+			return title
+		}
+		trimmed := strings.TrimLeftFunc(rest, func(r rune) bool {
+			return unicode.IsSpace(r) || strings.ContainsRune("-:：|・—–", r)
+		})
+		if trimmed == rest {
+			break
+		}
+		cleaned = trimmed
+	}
+	if cleaned == "" {
+		return title
+	}
+	return cleaned
 }
 
 func appendUnique(values []string, value string) []string {

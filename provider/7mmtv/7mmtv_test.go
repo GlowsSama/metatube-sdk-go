@@ -122,10 +122,10 @@ func TestMMTV_SearchMovieFiltersAndDeduplicates(t *testing.T) {
 			name:   "IPZ-950 prefers censored content",
 			number: "IPZ-950",
 			cards: searchCard("reducing-mosaic_content", "17192", "IPZ-950", "[無碼破解]IPZ-950 related copy", "/reducing.webp", "2022-09-20") +
-				searchCard("censored_content", "45526", "IPZ-950", "IPZ-950 exact", "/censored.webp", "2017-05-22") +
+				searchCard("censored_content", "45526", "IPZ-950", "IPZ-950 IPZ-950 アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな", "/censored.webp", "2017-05-22") +
 				searchCard("censored_content", "45527", "IPZ-951", "IPZ-951 related", "/wrong.webp", "2017-06-01"),
 			wantID:    "45526",
-			wantTitle: "IPZ-950 exact",
+			wantTitle: "アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな",
 		},
 		{
 			name:   "SNOS-377 prefers censored content",
@@ -135,7 +135,7 @@ func TestMMTV_SearchMovieFiltersAndDeduplicates(t *testing.T) {
 				searchCard("reducing-mosaic_content", "106870", "SNOS-377", "SNOS-377 reduced", "/reducing.webp", "2024-03-01") +
 				searchCard("censored_content", "206039", "SNOS-378", "SNOS-378 related", "/wrong.webp", "2024-04-01"),
 			wantID:    "206038",
-			wantTitle: "SNOS-377 censored",
+			wantTitle: "censored",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,7 +181,7 @@ func TestMMTV_GetMovieInfoByID(t *testing.T) {
 	assert.Equal(t, "IPZ-950", info.ID)
 	assert.Equal(t, "IPZ-950", info.Number)
 	assert.Equal(t, Name, info.Provider)
-	assert.Equal(t, "IPZ-950 アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな", info.Title)
+	assert.Equal(t, "アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな", info.Title)
 	assert.Equal(t, "2017-05-20", time.Time(info.ReleaseDate).Format("2006-01-02"))
 	assert.Equal(t, 118, info.Runtime)
 	assert.Equal(t, "はんきゅう太郎", info.Director)
@@ -206,6 +206,32 @@ func TestMMTV_GetMovieInfoByIDRelatedOnly(t *testing.T) {
 	info, err := m.GetMovieInfoByID("SNOS-377")
 	assert.Nil(t, info)
 	assert.ErrorIs(t, err, provider.ErrInfoNotFound)
+}
+
+func TestMMTV_CleanMovieTitle(t *testing.T) {
+	for _, tc := range []struct {
+		title string
+		id    string
+		want  string
+	}{
+		{
+			title: "IPZ-950 IPZ-950 アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな",
+			id:    "IPZ-950",
+			want:  "アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな",
+		},
+		{
+			title: "SNOS-377 タイトル",
+			id:    "SNOS-377",
+			want:  "タイトル",
+		},
+		{
+			title: "IPZ-9500 unrelated",
+			id:    "IPZ-950",
+			want:  "IPZ-9500 unrelated",
+		},
+	} {
+		assert.Equal(t, tc.want, cleanMovieTitle(tc.title, tc.id))
+	}
 }
 
 func TestMMTV_DetectPageError(t *testing.T) {

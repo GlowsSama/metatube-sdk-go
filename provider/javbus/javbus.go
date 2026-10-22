@@ -246,6 +246,8 @@ func (bus *JavBus) SearchMovie(keyword string) (results []*model.MovieSearchResu
 		return nil, errVerificationRequired
 	}
 
+	results = bus.filterSearchResults(results, keyword)
+
 	// JavBus search sometimes omits titles whose detail pages still exist.
 	if len(results) == 0 {
 		if id := bus.NormalizeMovieKeyword(keyword); id != "" {
@@ -256,7 +258,33 @@ func (bus *JavBus) SearchMovie(keyword string) (results []*model.MovieSearchResu
 			}
 		}
 	}
-	return
+	return bus.filterSearchResults(results, keyword), nil
+}
+
+func (bus *JavBus) filterSearchResults(results []*model.MovieSearchResult, keyword string) []*model.MovieSearchResult {
+	keyword = bus.NormalizeMovieKeyword(keyword)
+	if keyword == "" {
+		return nil
+	}
+
+	filtered := make([]*model.MovieSearchResult, 0, len(results))
+	seen := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		if result == nil || bus.NormalizeMovieKeyword(result.Number) != keyword {
+			continue
+		}
+
+		key := bus.NormalizeMovieID(result.ID)
+		if key == "" {
+			key = bus.NormalizeMovieKeyword(result.Number)
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		filtered = append(filtered, result)
+	}
+	return filtered
 }
 
 func isVerificationResponse(r *colly.Response) bool {
