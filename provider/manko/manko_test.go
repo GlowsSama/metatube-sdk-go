@@ -176,11 +176,10 @@ func TestManko_DetectPageError(t *testing.T) {
 }
 
 func TestManko_UsesFlareSolverrForSPAShell(t *testing.T) {
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	m := newTestManko(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(`<!doctype html><html><body><div id="app"></div><script src="/dist/build.js?v=1"></script></body></html>`))
-	}))
-	t.Cleanup(target.Close)
+	})
 
 	flare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1", r.URL.Path)
@@ -208,8 +207,6 @@ func TestManko_UsesFlareSolverrForSPAShell(t *testing.T) {
 	}))
 	t.Cleanup(flare.Close)
 
-	m := New()
-	m.Scraper = scraper.NewDefaultScraper(Name, target.URL+"/", Priority, language.English)
 	require.NoError(t, m.SetFlareSolverr(flare.URL+"/v1"))
 
 	results, err := m.SearchMovie("IPZ-950")
