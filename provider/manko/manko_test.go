@@ -175,6 +175,55 @@ func TestManko_DetectPageError(t *testing.T) {
 	}
 }
 
+func TestManko_UsesFlareSolverrForSPAShell(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><html><body><div id="app"></div><script src="/dist/build.js?v=1"></script></body></html>`))
+	}))
+	t.Cleanup(target.Close)
+
+	flare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1", r.URL.Path)
+		var payload struct {
+			URL string `json:"url"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+
+		response := ""
+		switch {
+		case strings.Contains(payload.URL, "/searchresult"):
+			response = mankoCard("IPZ-950", "https://manko.fun/movie-info/"+testHash, "/render.webp", "2017-05-24", "4.55")
+		case strings.Contains(payload.URL, "/movie-info/"+testHash):
+			response = mankoDetailPage()
+		default:
+			t.Errorf("unexpected FlareSolverr URL: %s", payload.URL)
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"solution": map[string]any{
+				"status":   http.StatusOK,
+				"response": response,
+			},
+		}))
+	}))
+	t.Cleanup(flare.Close)
+
+	m := New()
+	m.Scraper = scraper.NewDefaultScraper(Name, target.URL+"/", Priority, language.English)
+	require.NoError(t, m.SetFlareSolverr(flare.URL+"/v1"))
+
+	results, err := m.SearchMovie("IPZ-950")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "IPZ-950", results[0].ID)
+	assert.Equal(t, "https://manko.fun/movie-info/"+testHash, results[0].Homepage)
+
+	info, err := m.GetMovieInfoByID(testHash)
+	require.NoError(t, err)
+	assert.Equal(t, "IPZ-950", info.Number)
+	assert.Equal(t, testCover, info.CoverURL)
+}
+
 func TestManko_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Cf-Mitigated", "challenge")

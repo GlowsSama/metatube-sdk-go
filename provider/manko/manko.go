@@ -2,11 +2,15 @@ package manko
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gocolly/colly/v2"
@@ -18,6 +22,7 @@ import (
 	"github.com/metatube-community/metatube-sdk-go/common/parser"
 	"github.com/metatube-community/metatube-sdk-go/model"
 	"github.com/metatube-community/metatube-sdk-go/provider"
+	"github.com/metatube-community/metatube-sdk-go/provider/internal/flaresolverr"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/javnumber"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/scraper"
 )
@@ -30,6 +35,7 @@ var (
 	hashIDRe            = regexp.MustCompile(`(?i)^[0-9a-f]{24}$`)
 	backgroundImageRe   = regexp.MustCompile(`(?i)background-image\s*:\s*url\(\s*['"]?([^'")]+)`)
 	variantSuffixRe     = regexp.MustCompile(`(?i)(?:^|[-_\s])(?:uncensored(?:[-_\s]leak(?:ed)?)?|leak(?:ed)?|english[-_\s]subtitle|chinese[-_\s]subtitle|japanese[-_\s]subtitle|subtitle|sub)$`)
+	emptyAppShellRe     = regexp.MustCompile(`(?is)<div[^>]*\bid\s*=\s*["']app["'][^>]*>\s*</div>`)
 	errAntiBotChallenge = errors.New("Manko returned a Cloudflare challenge")
 )
 
@@ -43,6 +49,9 @@ const (
 type Manko struct {
 	*fetch.Fetcher
 	*scraper.Scraper
+
+	flareMu     sync.RWMutex
+	flareClient *flaresolverr.Client
 }
 
 func New() *Manko {
@@ -55,6 +64,26 @@ func New() *Manko {
 			}),
 		),
 	}
+}
+
+func (m *Manko) SetFlareSolverr(endpoint string) error {
+	if err := m.Scraper.SetFlareSolverr(endpoint); err != nil {
+		return err
+	}
+
+	var client *flaresolverr.Client
+	if strings.TrimSpace(endpoint) != "" {
+		var err error
+		client, err = flaresolverr.NewClient(endpoint, time.Minute)
+		if err != nil {
+			return err
+		}
+	}
+
+	m.flareMu.Lock()
+	m.flareClient = client
+	m.flareMu.Unlock()
+	return nil
 }
 
 func (m *Manko) NormalizeMovieID(id string) string {
@@ -191,6 +220,36 @@ func (m *Manko) fetchPage(rawURL string) ([]byte, error) {
 	}
 	if len(body) == 0 {
 		return nil, fmt.Errorf("%s: empty response", Name)
+	}
+	if isSPAAppShell(body) {
+		return m.fetchRenderedPage(rawURL)
+	}
+	return body, nil
+}
+
+func (m *Manko) fetchRenderedPage(rawURL string) ([]byte, error) {
+	m.flareMu.RLock()
+	client := m.flareClient
+	m.flareMu.RUnlock()
+	if client == nil {
+		return nil, fmt.Errorf("%s: SPA page requires FlareSolverr", Name)
+	}
+
+	headers := make(http.Header)
+	headers.Set("Accept-Language", "en-US,en;q=0.9")
+	headers.Set("Referer", m.URL().String())
+	body, err := client.Get(context.Background(), rawURL, headers)
+	if err != nil {
+		return nil, fmt.Errorf("%s: render SPA page with FlareSolverr: %w", Name, err)
+	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("%s: FlareSolverr returned an empty response", Name)
+	}
+	if err := detectPageError(body); err != nil {
+		return nil, err
+	}
+	if isSPAAppShell(body) {
+		return nil, fmt.Errorf("%s: FlareSolverr did not render SPA content", Name)
 	}
 	return body, nil
 }
@@ -413,6 +472,12 @@ func detectPageError(body []byte) error {
 		return errAntiBotChallenge
 	}
 	return nil
+}
+
+func isSPAAppShell(body []byte) bool {
+	content := strings.ToLower(string(body))
+	return strings.Contains(content, "/dist/build.js") &&
+		emptyAppShellRe.MatchString(content)
 }
 
 func firstText(selection *goquery.Selection) string {
