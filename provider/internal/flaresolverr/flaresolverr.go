@@ -115,6 +115,18 @@ func (c *Client) SetTimeout(timeout time.Duration) {
 	c.mu.Unlock()
 }
 
+// Get solves a GET request and returns the rendered response body.
+func (c *Client) Get(ctx context.Context, target string, headers http.Header) ([]byte, error) {
+	solution, err := c.solve(ctx, http.MethodGet, target, headers)
+	if err != nil {
+		return nil, err
+	}
+	if solution.Status < http.StatusOK || solution.Status >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("FlareSolverr target returned HTTP %d", solution.Status)
+	}
+	return []byte(solution.Response), nil
+}
+
 func (c *Client) solve(ctx context.Context, method, target string, headers http.Header) (*solution, error) {
 	c.mu.RLock()
 	httpClient := c.httpClient
