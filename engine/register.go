@@ -31,6 +31,7 @@ import (
 	_ "github.com/metatube-community/metatube-sdk-go/provider/javdb"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/javfree"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/javlibrary"
+	_ "github.com/metatube-community/metatube-sdk-go/provider/javverse"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/kin8tengoku"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/mgstage"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/muramura"
