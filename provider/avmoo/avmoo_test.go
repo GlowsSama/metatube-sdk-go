@@ -137,6 +137,7 @@ func TestAVMoo_GetMovieInfoByID(t *testing.T) {
 		"https://jp.netcdn.space/digital/video/ipz00950/ipz00950-1.jpg",
 		"https://jp.netcdn.space/digital/video/ipz00950/ipz00950-2.jpg",
 	}, []string(info.PreviewImages))
+	assert.Empty(t, info.Summary)
 }
 
 func TestAVMoo_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {

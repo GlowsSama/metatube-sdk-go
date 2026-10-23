@@ -414,11 +414,6 @@ func (p *Provider) parseMovieInfo(body []byte, id, homepage string) (*model.Movi
 		})
 	}
 
-	if description := firstAttr(doc.Find(
-		`meta[name="description"], meta[property="og:description"]`).First(), "content"); description != "" {
-		info.Summary = cleanText(description)
-	}
-
 	if info.Title == "" || info.Number == "" {
 		return nil, fmt.Errorf("%s: unrecognized detail response", p.Name())
 	}

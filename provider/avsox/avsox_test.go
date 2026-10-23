@@ -129,4 +129,5 @@ func TestAVSOX_GetMovieInfoByID(t *testing.T) {
 		"https://jp.netcdn.space/digital/video/heyzo003993/heyzo003993-1.jpg",
 		"https://jp.netcdn.space/digital/video/heyzo003993/heyzo003993-2.jpg",
 	}, []string(info.PreviewImages))
+	assert.Empty(t, info.Summary)
 }
