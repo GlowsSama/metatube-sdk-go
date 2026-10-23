@@ -10,6 +10,7 @@ import (
 	_ "github.com/metatube-community/metatube-sdk-go/provider/avbase"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/aventertainments"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/avmoo"
+	_ "github.com/metatube-community/metatube-sdk-go/provider/avsox"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/c0930"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/caribbeancom"
 	_ "github.com/metatube-community/metatube-sdk-go/provider/caribbeancompr"
