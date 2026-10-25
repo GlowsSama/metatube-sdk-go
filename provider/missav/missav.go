@@ -302,8 +302,7 @@ func (m *MissAV) parseSearchResults(base *url.URL, body []byte, keyword string) 
 	return results, nil
 }
 
-func (m *MissAV) parseMovieInfo(base *url.URL, body []byte, id,
-	homepage string) (*model.MovieInfo, error) {
+func (m *MissAV) parseMovieInfo(base *url.URL, body []byte, id, homepage string) (*model.MovieInfo, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%s: parse detail response: %w", Name, err)
