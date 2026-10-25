@@ -242,8 +242,7 @@ func (m *MissAV) fetchPage(rawURL string) ([]byte, error) {
 	return body, nil
 }
 
-func (m *MissAV) parseSearchResults(base *url.URL, body []byte,
-	keyword string) ([]*model.MovieSearchResult, error) {
+func (m *MissAV) parseSearchResults(base *url.URL, body []byte, keyword string) ([]*model.MovieSearchResult, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%s: parse search response: %w", Name, err)
