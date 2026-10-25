@@ -19,6 +19,7 @@ import (
 	"github.com/metatube-community/metatube-sdk-go/model"
 	"github.com/metatube-community/metatube-sdk-go/provider"
 	"github.com/metatube-community/metatube-sdk-go/provider/fc2/fc2util"
+	"github.com/metatube-community/metatube-sdk-go/provider/internal/domainpool"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/scraper"
 )
 
@@ -26,6 +27,8 @@ var (
 	_ provider.MovieProvider = (*JavDB)(nil)
 	_ provider.MovieSearcher = (*JavDB)(nil)
 	_ provider.Fetcher       = (*JavDB)(nil)
+	_ provider.DomainSetter  = (*JavDB)(nil)
+	_ provider.URLMatcher    = (*JavDB)(nil)
 
 	scorePattern        = regexp.MustCompile(`\d+(?:\.\d+)?`)
 	idPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
@@ -49,6 +52,7 @@ const (
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
+	domains *domainpool.Pool
 }
 
 func New() *JavDB {
@@ -59,7 +63,20 @@ func New() *JavDB {
 				"Referer":         baseURL,
 				"Accept-Language": "zh-CN,zh;q=0.9",
 			})),
+		domains: domainpool.New(),
 	}
+}
+
+func (jav *JavDB) SetBackupDomains(domains []string) error {
+	return jav.domains.SetBackups(domains)
+}
+
+func (jav *JavDB) Domains() []string {
+	return jav.domains.Domains(jav.URL())
+}
+
+func (jav *JavDB) MatchesURL(u *url.URL) bool {
+	return u != nil && (jav.domains.Matches(jav.URL(), u) || isSiteHost(u.Hostname()))
 }
 
 func (jav *JavDB) NormalizeMovieID(id string) string {
@@ -87,9 +104,7 @@ func (jav *JavDB) ParseMovieIDFromURL(rawURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if (u.Scheme != "http" && u.Scheme != "https") ||
-		(!strings.EqualFold(u.Hostname(), "javdb.com") &&
-			!strings.EqualFold(u.Hostname(), "www.javdb.com")) {
+	if (u.Scheme != "http" && u.Scheme != "https") || !jav.MatchesURL(u) {
 		return "", provider.ErrInvalidURL
 	}
 
@@ -112,16 +127,9 @@ func (jav *JavDB) ParseMovieIDFromURL(rawURL string) (string, error) {
 }
 
 func (jav *JavDB) GetMovieInfoByURL(rawURL string) (*model.MovieInfo, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, err
-	}
 	id, err := jav.ParseMovieIDFromURL(rawURL)
 	if err != nil {
 		return nil, err
-	}
-	if _, ok := detailSlugFromPath(u.Path); ok {
-		return jav.getMovieInfoByDetailURL(u.String(), id)
 	}
 	return jav.GetMovieInfoByID(id)
 }
@@ -131,10 +139,27 @@ func (jav *JavDB) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
 	if id == "" {
 		return nil, provider.ErrInvalidID
 	}
-	if isNumberLike(id) {
-		return jav.getMovieInfoByNumber(id)
+
+	var lastErr error
+	for _, base := range jav.domains.Candidates(jav.URL()) {
+		var (
+			info *model.MovieInfo
+			err  error
+		)
+		if isNumberLike(id) {
+			info, err = jav.getMovieInfoByNumber(base, id)
+		} else {
+			info, err = jav.getMovieInfoByDetailURL(base, jav.detailURL(base, id), id)
+		}
+		if err == nil {
+			return info, nil
+		}
+		if stopDomainFallback(err) {
+			return nil, err
+		}
+		lastErr = err
 	}
-	return jav.getMovieInfoByDetailURL(jav.detailURL(id), id)
+	return nil, lastErr
 }
 
 func (jav *JavDB) NormalizeMovieKeyword(keyword string) string {
@@ -160,19 +185,28 @@ func (jav *JavDB) SearchMovie(keyword string) ([]*model.MovieSearchResult, error
 	if keyword == "" {
 		return nil, provider.ErrInvalidKeyword
 	}
-	results, err := jav.searchMovie(keyword)
-	if err != nil {
-		return nil, err
+
+	var lastErr error
+	for _, base := range jav.domains.Candidates(jav.URL()) {
+		results, err := jav.searchMovie(base, keyword)
+		if err != nil {
+			if stopDomainFallback(err) {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
+		return jav.filterSearchResults(results, keyword), nil
 	}
-	return jav.filterSearchResults(results, keyword), nil
+	return nil, lastErr
 }
 
-func (jav *JavDB) searchMovie(keyword string) ([]*model.MovieSearchResult, error) {
-	body, err := jav.fetchPage(jav.searchURL(keyword))
+func (jav *JavDB) searchMovie(base *url.URL, keyword string) ([]*model.MovieSearchResult, error) {
+	body, err := jav.fetchPage(jav.searchURL(base, keyword))
 	if err != nil {
 		return nil, err
 	}
-	return jav.parseSearchResults(body)
+	return jav.parseSearchResults(base, body)
 }
 
 func (jav *JavDB) filterSearchResults(results []*model.MovieSearchResult, keyword string) []*model.MovieSearchResult {
@@ -186,12 +220,12 @@ func (jav *JavDB) filterSearchResults(results []*model.MovieSearchResult, keywor
 	return filtered
 }
 
-func (jav *JavDB) getMovieInfoByNumber(n string) (*model.MovieInfo, error) {
+func (jav *JavDB) getMovieInfoByNumber(base *url.URL, n string) (*model.MovieInfo, error) {
 	keyword := jav.NormalizeMovieKeyword(n)
 	if keyword == "" {
 		return nil, provider.ErrInvalidID
 	}
-	results, err := jav.searchMovie(keyword)
+	results, err := jav.searchMovie(base, keyword)
 	if err != nil {
 		return nil, err
 	}
@@ -207,15 +241,15 @@ func (jav *JavDB) getMovieInfoByNumber(n string) (*model.MovieInfo, error) {
 	if fc2ID := fc2util.ParseNumber(result.Number); fc2ID != "" {
 		return searchResultToInfo(result), nil
 	}
-	return jav.getMovieInfoByDetailURL(result.Homepage, result.ID)
+	return jav.getMovieInfoByDetailURL(base, result.Homepage, result.ID)
 }
 
-func (jav *JavDB) getMovieInfoByDetailURL(rawURL, id string) (*model.MovieInfo, error) {
+func (jav *JavDB) getMovieInfoByDetailURL(base *url.URL, rawURL, id string) (*model.MovieInfo, error) {
 	body, err := jav.fetchPage(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	return jav.parseMovieInfo(body, id, rawURL)
+	return jav.parseMovieInfo(base, body, id, rawURL)
 }
 
 func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
@@ -225,6 +259,12 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 		body        []byte
 		responseErr error
 	)
+	if u, err := url.Parse(rawURL); err == nil && u.Host != "" {
+		referer := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}).String()
+		c.OnRequest(func(r *colly.Request) {
+			r.Headers.Set("Referer", referer)
+		})
+	}
 	c.OnResponse(func(r *colly.Response) {
 		body = append([]byte(nil), r.Body...)
 	})
@@ -256,7 +296,7 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 	return body, nil
 }
 
-func (jav *JavDB) parseSearchResults(body []byte) ([]*model.MovieSearchResult, error) {
+func (jav *JavDB) parseSearchResults(base *url.URL, body []byte) ([]*model.MovieSearchResult, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%s: parse search response: %w", jav.Name(), err)
@@ -293,7 +333,7 @@ func (jav *JavDB) parseSearchResults(body []byte) ([]*model.MovieSearchResult, e
 			return
 		}
 
-		cover := jav.absoluteURL(firstAttr(item.Find(".cover img").First(),
+		cover := jav.absoluteURL(base, firstAttr(item.Find(".cover img").First(),
 			"data-src", "data-original", "src"))
 		resultID := id
 		if fc2ID := fc2util.ParseNumber(number); fc2ID != "" {
@@ -304,7 +344,7 @@ func (jav *JavDB) parseSearchResults(body []byte) ([]*model.MovieSearchResult, e
 			Number:      number,
 			Title:       title,
 			Provider:    jav.Name(),
-			Homepage:    jav.absoluteURL(href),
+			Homepage:    jav.absoluteURL(base, href),
 			ThumbURL:    cover,
 			CoverURL:    cover,
 			Score:       parseScore(item.Find(".score").Text()),
@@ -321,12 +361,12 @@ func (jav *JavDB) parseSearchResults(body []byte) ([]*model.MovieSearchResult, e
 		return nil, errLoginRequired
 	}
 	if hasNoResults(doc) {
-		return nil, provider.ErrInfoNotFound
+		return []*model.MovieSearchResult{}, nil
 	}
 	return nil, fmt.Errorf("%s: unrecognized search response", jav.Name())
 }
 
-func (jav *JavDB) parseMovieInfo(body []byte, id, homepage string) (*model.MovieInfo, error) {
+func (jav *JavDB) parseMovieInfo(base *url.URL, body []byte, id, homepage string) (*model.MovieInfo, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%s: parse detail response: %w", jav.Name(), err)
@@ -343,7 +383,7 @@ func (jav *JavDB) parseMovieInfo(body []byte, id, homepage string) (*model.Movie
 	}
 
 	coverSelection := doc.Find("img.video-cover, .video-cover img, .column-video-cover img").First()
-	info.CoverURL = jav.absoluteURL(firstAttr(coverSelection,
+	info.CoverURL = jav.absoluteURL(base, firstAttr(coverSelection,
 		"data-src", "data-original", "src"))
 	info.ThumbURL = info.CoverURL
 
@@ -400,7 +440,7 @@ func (jav *JavDB) parseMovieInfo(body []byte, id, homepage string) (*model.Movie
 	})
 
 	doc.Find(".preview-images .tile-item, .tile-images.preview-images a").Each(func(_ int, image *goquery.Selection) {
-		preview := jav.absoluteURL(firstAttr(image, "href", "data-src", "src"))
+		preview := jav.absoluteURL(base, firstAttr(image, "href", "data-src", "src"))
 		info.PreviewImages = appendUnique(info.PreviewImages, preview)
 	})
 
@@ -425,20 +465,20 @@ func (jav *JavDB) movieIDFromPath(href string) string {
 	return id
 }
 
-func (jav *JavDB) detailURL(id string) string {
-	return jav.URL().ResolveReference(&url.URL{Path: "/v/" + id}).String()
+func (jav *JavDB) detailURL(base *url.URL, id string) string {
+	return base.ResolveReference(&url.URL{Path: "/v/" + id}).String()
 }
 
-func (jav *JavDB) searchURL(keyword string) string {
+func (jav *JavDB) searchURL(base *url.URL, keyword string) string {
 	query := url.Values{
 		"q":      {keyword},
 		"f":      {"all"},
 		"locale": {"zh"},
 	}
-	return jav.URL().ResolveReference(&url.URL{Path: "/search", RawQuery: query.Encode()}).String()
+	return base.ResolveReference(&url.URL{Path: "/search", RawQuery: query.Encode()}).String()
 }
 
-func (jav *JavDB) absoluteURL(rawURL string) string {
+func (jav *JavDB) absoluteURL(base *url.URL, rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return ""
@@ -447,13 +487,24 @@ func (jav *JavDB) absoluteURL(rawURL string) string {
 	if err != nil {
 		return ""
 	}
-	return jav.URL().ResolveReference(u).String()
+	return base.ResolveReference(u).String()
 }
 
 func isNumberLike(id string) bool {
 	return numericPattern.MatchString(id) ||
 		strings.ContainsAny(id, "-_") ||
 		upperNumberPattern.MatchString(id)
+}
+
+func isSiteHost(host string) bool {
+	host = strings.TrimPrefix(strings.TrimSuffix(strings.ToLower(host), "."), "www.")
+	return host == "javdb.com"
+}
+
+func stopDomainFallback(err error) bool {
+	return errors.Is(err, provider.ErrInfoNotFound) ||
+		errors.Is(err, provider.ErrInvalidID) ||
+		errors.Is(err, provider.ErrInvalidKeyword)
 }
 
 func detailSlugFromPath(urlPath string) (string, bool) {

@@ -29,6 +29,16 @@ type flareSolverrResponse struct {
 	} `json:"error"`
 }
 
+type domainsResponse struct {
+	Data struct {
+		Providers map[string][]string `json:"providers"`
+	} `json:"data"`
+	Error struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
 func TestFlareSolverrConfig(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	app := engine.New(nil)
@@ -75,5 +85,60 @@ func TestFlareSolverrConfig(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 		assert.Empty(t, response.Data.Endpoint)
 		assert.NotEmpty(t, response.Data.Providers)
+	})
+}
+
+func TestDomainsConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	app := engine.New(nil)
+	router := route.New(app, auth.Token(testToken))
+
+	send := func(body, token string) (*httptest.ResponseRecorder, domainsResponse) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/v1/config/domains",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		var response domainsResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+		return rec, response
+	}
+
+	t.Run("requires authentication", func(t *testing.T) {
+		rec, response := send(`{"providers":{"JavDB":["backup.example"]}}`, "")
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, http.StatusUnauthorized, response.Error.Code)
+	})
+
+	t.Run("configures and normalizes domains", func(t *testing.T) {
+		rec, response := send(
+			`{"providers":{"JavDB":["https://backup.example/path"],"MissAV":["missav-backup.example"]}}`,
+			testToken,
+		)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Equal(t, []string{"https://javdb.com/", "https://backup.example/"},
+			response.Data.Providers["JavDB"])
+		assert.Equal(t, []string{"https://missav.ws/", "https://missav-backup.example/"},
+			response.Data.Providers["MissAV"])
+	})
+
+	t.Run("rejects too many domains", func(t *testing.T) {
+		rec, response := send(
+			`{"providers":{"JavDB":["one.example","two.example","three.example","four.example","five.example"]}}`,
+			testToken,
+		)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, response.Error.Message, "at most 5 total domains")
+	})
+
+	t.Run("rejects unsupported providers", func(t *testing.T) {
+		rec, response := send(`{"providers":{"FC2":["backup.example"]}}`, testToken)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, response.Error.Message, "does not support custom domains")
 	})
 }

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -93,6 +94,92 @@ func TestMissAV_SearchFiltersVariantsAndDuplicates(t *testing.T) {
 	assert.Equal(t, "IPZ-950", results[0].ID)
 	assert.Equal(t, "IPZ-950", results[0].Number)
 	assert.Equal(t, "Exact title", results[0].Title)
+}
+
+func TestMissAV_FallsBackToConfiguredDomain(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `<html><body>maintenance</body></html>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "http://"+r.Host+"/", r.Referer())
+		switch r.URL.Path {
+		case "/ja/search/IPZ-950":
+			fmt.Fprint(w, missAVCard("/dm102/ja/ipz-950", "IPZ-950 Backup title", "/backup-thumb.jpg"))
+		case "/dm102/ja/ipz-950":
+			fmt.Fprint(w, missAVDetailPage())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(backup.Close)
+
+	m := New()
+	m.Scraper = scraper.NewDefaultScraper(Name, primary.URL+"/", Priority, language.Japanese)
+	require.NoError(t, m.SetBackupDomains([]string{backup.URL + "/ignored-path"}))
+
+	info, err := m.GetMovieInfoByID("IPZ-950")
+	require.NoError(t, err)
+	assert.Equal(t, backup.URL+"/dm102/ja/ipz-950", info.Homepage)
+	assert.Equal(t, "アタッカーズ全面監修 夫の目の前で犯●れて― 桃乃木かな", info.Title)
+
+	id, err := m.ParseMovieIDFromURL(backup.URL + "/dm102/ja/ipz-950")
+	require.NoError(t, err)
+	assert.Equal(t, "IPZ-950", id)
+}
+
+func TestMissAV_DoesNotFallbackAfterNormalEmptySearch(t *testing.T) {
+	var backupHits int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `<html><body>No results found</body></html>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backupHits++
+		fmt.Fprint(w, missAVCard("/dm102/ja/ipz-950", "Unexpected fallback", "/cover.jpg"))
+	}))
+	t.Cleanup(backup.Close)
+
+	m := New()
+	m.Scraper = scraper.NewDefaultScraper(Name, primary.URL+"/", Priority, language.Japanese)
+	require.NoError(t, m.SetBackupDomains([]string{backup.URL}))
+
+	results, err := m.SearchMovie("IPZ-950")
+	require.NoError(t, err)
+	assert.Empty(t, results)
+	assert.Zero(t, backupHits)
+}
+
+func TestMissAV_DomainFallbackIsBounded(t *testing.T) {
+	var mu sync.Mutex
+	hits := make([]int, 5)
+	servers := make([]*httptest.Server, 0, 5)
+	for i := range 5 {
+		index := i
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			mu.Lock()
+			hits[index]++
+			mu.Unlock()
+			fmt.Fprint(w, `<html><body>maintenance</body></html>`)
+		}))
+		servers = append(servers, server)
+		t.Cleanup(server.Close)
+	}
+
+	m := New()
+	m.Scraper = scraper.NewDefaultScraper(Name, servers[0].URL+"/", Priority, language.Japanese)
+	backups := make([]string, 0, len(servers)-1)
+	for _, server := range servers[1:] {
+		backups = append(backups, server.URL)
+	}
+	require.NoError(t, m.SetBackupDomains(backups))
+
+	results, err := m.SearchMovie("IPZ-950")
+	require.Error(t, err)
+	assert.Empty(t, results)
+	assert.Equal(t, []int{1, 1, 1, 1, 1}, hits)
 }
 
 func TestMissAV_GetMovieInfoByID(t *testing.T) {

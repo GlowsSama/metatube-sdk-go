@@ -130,6 +130,11 @@ func (e *Engine) GetMovieProviderByURL(rawURL string) (mt.MovieProvider, error) 
 			return p, nil
 		}
 	}
+	for _, p := range e.movieProviders.Iterator() {
+		if matcher, ok := p.(mt.URLMatcher); ok && matcher.MatchesURL(u) {
+			return p, nil
+		}
+	}
 	return nil, mt.ErrProviderNotFound
 }
 
@@ -193,6 +198,31 @@ func (e *Engine) SetFlareSolverr(endpoint string) ([]string, error) {
 			len(configured), endpoint)
 	}
 	return configured, nil
+}
+
+// SetProviderDomains configures fallback domains for a provider.
+// It returns the normalized primary and fallback domains.
+func (e *Engine) SetProviderDomains(name string, backups []string) ([]string, error) {
+	var provider mt.Provider
+	if movieProvider, err := e.GetMovieProviderByName(name); err == nil {
+		provider = movieProvider
+	} else if actorProvider, err := e.GetActorProviderByName(name); err == nil {
+		provider = actorProvider
+	} else {
+		return nil, mt.ErrProviderNotFound
+	}
+
+	setter, ok := provider.(mt.DomainSetter)
+	if !ok {
+		return nil, fmt.Errorf("provider %s does not support custom domains", provider.Name())
+	}
+	if err := setter.SetBackupDomains(backups); err != nil {
+		return nil, fmt.Errorf("configure %s domains: %w", provider.Name(), err)
+	}
+
+	domains := setter.Domains()
+	e.logger.Printf("Configured %s domains: %s", provider.Name(), strings.Join(domains, ", "))
+	return domains, nil
 }
 
 // Fetch fetches content from url. If the provider

@@ -126,6 +126,97 @@ func TestJavDB_SearchMovieFiltersRelatedNumbers(t *testing.T) {
 	assert.Empty(t, results)
 }
 
+func TestJavDB_FallsBackToConfiguredDomain(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `<html><body>maintenance</body></html>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "http://"+r.Host+"/", r.Referer())
+		switch r.URL.Path {
+		case "/search":
+			assert.Equal(t, "SONE-065", r.URL.Query().Get("q"))
+			fmt.Fprint(w, `<div class="movie-list">`+
+				card("Backup1", "SONE-065", "Backup title", "/backup-cover.jpg")+`</div>`)
+		case "/v/Backup1":
+			fmt.Fprint(w, detailPage("SONE-065", "Backup title", "/backup-cover.jpg"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(backup.Close)
+
+	jav := New()
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+	require.NoError(t, jav.SetBackupDomains([]string{backup.URL + "/ignored-path"}))
+
+	info, err := jav.GetMovieInfoByID("SONE-065")
+	require.NoError(t, err)
+	assert.Equal(t, "Backup title", info.Title)
+	assert.Equal(t, backup.URL+"/v/Backup1", info.Homepage)
+	assert.Equal(t, backup.URL+"/backup-cover.jpg", info.CoverURL)
+	assert.Equal(t, []string{backup.URL + "/samples/1.jpg"}, []string(info.PreviewImages))
+
+	id, err := jav.ParseMovieIDFromURL(backup.URL + "/v/Backup1?locale=zh")
+	require.NoError(t, err)
+	assert.Equal(t, "Backup1", id)
+}
+
+func TestJavDB_DoesNotFallbackAfterNormalEmptySearch(t *testing.T) {
+	var backupHits int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `<div class="movie-list"></div><div class="empty-message">沒有資料</div>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backupHits++
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("Backup1", "SONE-065", "Unexpected fallback", "/cover.jpg")+`</div>`)
+	}))
+	t.Cleanup(backup.Close)
+
+	jav := New()
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
+
+	results, err := jav.SearchMovie("SONE-065")
+	require.NoError(t, err)
+	assert.Empty(t, results)
+	assert.Zero(t, backupHits)
+}
+
+func TestJavDB_DomainFallbackIsBounded(t *testing.T) {
+	var mu sync.Mutex
+	hits := make([]int, 5)
+	servers := make([]*httptest.Server, 0, 5)
+	for i := range 5 {
+		index := i
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			mu.Lock()
+			hits[index]++
+			mu.Unlock()
+			fmt.Fprint(w, `<html><body>maintenance</body></html>`)
+		}))
+		servers = append(servers, server)
+		t.Cleanup(server.Close)
+	}
+
+	jav := New()
+	jav.Scraper = scraper.NewDefaultScraper(Name, servers[0].URL, Priority, language.Chinese)
+	backups := make([]string, 0, len(servers)-1)
+	for _, server := range servers[1:] {
+		backups = append(backups, server.URL)
+	}
+	require.NoError(t, jav.SetBackupDomains(backups))
+
+	results, err := jav.SearchMovie("SONE-065")
+	require.Error(t, err)
+	assert.Empty(t, results)
+	assert.Equal(t, []int{1, 1, 1, 1, 1}, hits)
+}
+
 func TestJavDB_NumberLookupFetchesDetailPage(t *testing.T) {
 	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

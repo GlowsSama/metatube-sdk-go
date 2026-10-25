@@ -19,6 +19,7 @@ import (
 	"github.com/metatube-community/metatube-sdk-go/common/parser"
 	"github.com/metatube-community/metatube-sdk-go/model"
 	"github.com/metatube-community/metatube-sdk-go/provider"
+	"github.com/metatube-community/metatube-sdk-go/provider/internal/domainpool"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/javnumber"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/scraper"
 )
@@ -27,6 +28,8 @@ var (
 	_ provider.MovieProvider = (*MissAV)(nil)
 	_ provider.MovieSearcher = (*MissAV)(nil)
 	_ provider.Fetcher       = (*MissAV)(nil)
+	_ provider.DomainSetter  = (*MissAV)(nil)
+	_ provider.URLMatcher    = (*MissAV)(nil)
 
 	detailSlugRe        = regexp.MustCompile(`(?i)^[a-z][a-z0-9]{0,31}[-_\s]?\d{2,8}$`)
 	variantSlugRe       = regexp.MustCompile(`(?i)(?:uncensored(?:-leak)?|leak|english-subtitle|chinese-subtitle|japanese-subtitle|subtitle)$`)
@@ -43,6 +46,7 @@ const (
 type MissAV struct {
 	*fetch.Fetcher
 	*scraper.Scraper
+	domains *domainpool.Pool
 }
 
 func New() *MissAV {
@@ -53,7 +57,20 @@ func New() *MissAV {
 				"Referer":         baseURL,
 				"Accept-Language": "ja-JP,ja;q=0.9",
 			})),
+		domains: domainpool.New(),
 	}
+}
+
+func (m *MissAV) SetBackupDomains(domains []string) error {
+	return m.domains.SetBackups(domains)
+}
+
+func (m *MissAV) Domains() []string {
+	return m.domains.Domains(m.URL())
+}
+
+func (m *MissAV) MatchesURL(u *url.URL) bool {
+	return u != nil && (m.domains.Matches(m.URL(), u) || m.isSiteHost(u.Hostname()))
 }
 
 func (m *MissAV) NormalizeMovieID(id string) string {
@@ -65,7 +82,7 @@ func (m *MissAV) ParseMovieIDFromURL(rawURL string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if (u.Scheme != "http" && u.Scheme != "https") || !m.isSiteHost(u.Hostname()) {
+	if (u.Scheme != "http" && u.Scheme != "https") || !m.MatchesURL(u) {
 		return "", provider.ErrInvalidURL
 	}
 
@@ -96,14 +113,31 @@ func (m *MissAV) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
 	if id == "" {
 		return nil, provider.ErrInvalidID
 	}
-	results, err := m.SearchMovie(id)
-	if err != nil {
-		return nil, err
+
+	var lastErr error
+	for _, base := range m.domains.Candidates(m.URL()) {
+		results, err := m.searchMovie(base, id)
+		if err != nil {
+			if stopDomainFallback(err) {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
+		if len(results) == 0 {
+			return nil, provider.ErrInfoNotFound
+		}
+
+		info, err := m.getMovieInfoByURL(base, results[0].Homepage, results[0].ID)
+		if err == nil {
+			return info, nil
+		}
+		if stopDomainFallback(err) {
+			return nil, err
+		}
+		lastErr = err
 	}
-	if len(results) == 0 {
-		return nil, provider.ErrInfoNotFound
-	}
-	return m.getMovieInfoByURL(results[0].Homepage, results[0].ID)
+	return nil, lastErr
 }
 
 func (m *MissAV) GetMovieInfoByURL(rawURL string) (*model.MovieInfo, error) {
@@ -111,7 +145,7 @@ func (m *MissAV) GetMovieInfoByURL(rawURL string) (*model.MovieInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	return m.getMovieInfoByURL(rawURL, id)
+	return m.GetMovieInfoByID(id)
 }
 
 func (m *MissAV) NormalizeMovieKeyword(keyword string) string {
@@ -123,23 +157,39 @@ func (m *MissAV) SearchMovie(keyword string) ([]*model.MovieSearchResult, error)
 	if keyword == "" {
 		return nil, provider.ErrInvalidKeyword
 	}
-	body, err := m.fetchPage(m.searchURL(keyword))
+
+	var lastErr error
+	for _, base := range m.domains.Candidates(m.URL()) {
+		results, err := m.searchMovie(base, keyword)
+		if err == nil {
+			return results, nil
+		}
+		if stopDomainFallback(err) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (m *MissAV) searchMovie(base *url.URL, keyword string) ([]*model.MovieSearchResult, error) {
+	body, err := m.fetchPage(m.searchURL(base, keyword))
 	if err != nil {
 		return nil, err
 	}
-	return m.parseSearchResults(body, keyword)
+	return m.parseSearchResults(base, body, keyword)
 }
 
-func (m *MissAV) getMovieInfoByURL(rawURL, id string) (*model.MovieInfo, error) {
+func (m *MissAV) getMovieInfoByURL(base *url.URL, rawURL, id string) (*model.MovieInfo, error) {
 	body, err := m.fetchPage(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	return m.parseMovieInfo(body, id, rawURL)
+	return m.parseMovieInfo(base, body, id, rawURL)
 }
 
-func (m *MissAV) searchURL(keyword string) string {
-	return m.URL().ResolveReference(&url.URL{
+func (m *MissAV) searchURL(base *url.URL, keyword string) string {
+	return base.ResolveReference(&url.URL{
 		Path: "/ja/search/" + keyword,
 	}).String()
 }
@@ -151,6 +201,12 @@ func (m *MissAV) fetchPage(rawURL string) ([]byte, error) {
 		body        []byte
 		responseErr error
 	)
+	if u, err := url.Parse(rawURL); err == nil && u.Host != "" {
+		referer := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}).String()
+		c.OnRequest(func(r *colly.Request) {
+			r.Headers.Set("Referer", referer)
+		})
+	}
 	c.OnResponse(func(r *colly.Response) {
 		body = append([]byte(nil), r.Body...)
 	})
@@ -186,7 +242,8 @@ func (m *MissAV) fetchPage(rawURL string) ([]byte, error) {
 	return body, nil
 }
 
-func (m *MissAV) parseSearchResults(body []byte, keyword string) ([]*model.MovieSearchResult, error) {
+func (m *MissAV) parseSearchResults(base *url.URL, body []byte,
+	keyword string) ([]*model.MovieSearchResult, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%s: parse search response: %w", Name, err)
@@ -194,7 +251,8 @@ func (m *MissAV) parseSearchResults(body []byte, keyword string) ([]*model.Movie
 
 	results := make([]*model.MovieSearchResult, 0)
 	seen := make(map[string]struct{})
-	doc.Find(".thumbnail.group").Each(func(_ int, item *goquery.Selection) {
+	items := doc.Find(".thumbnail.group")
+	items.Each(func(_ int, item *goquery.Selection) {
 		link := item.Find(".my-2 a").First()
 		if link.Length() == 0 {
 			link = item.Find("a[href]").First()
@@ -203,7 +261,7 @@ func (m *MissAV) parseSearchResults(body []byte, keyword string) ([]*model.Movie
 		if !ok {
 			return
 		}
-		homepage := m.absoluteURL(href)
+		homepage := m.absoluteURL(base, href)
 		id, parseErr := m.ParseMovieIDFromURL(homepage)
 		if parseErr != nil || !strings.EqualFold(id, keyword) {
 			return
@@ -220,7 +278,7 @@ func (m *MissAV) parseSearchResults(body []byte, keyword string) ([]*model.Movie
 		if title == "" {
 			title = id
 		}
-		cover := m.absoluteURL(firstAttr(item.Find(".thumbnail img").First(),
+		cover := m.absoluteURL(base, firstAttr(item.Find(".thumbnail img").First(),
 			"data-src", "data-original", "src"))
 		result := &model.MovieSearchResult{
 			ID:          id,
@@ -237,12 +295,16 @@ func (m *MissAV) parseSearchResults(body []byte, keyword string) ([]*model.Movie
 		}
 	})
 	if len(results) == 0 {
-		return nil, provider.ErrInfoNotFound
+		if items.Length() > 0 || hasNoSearchResults(doc) {
+			return []*model.MovieSearchResult{}, nil
+		}
+		return nil, fmt.Errorf("%s: unrecognized search response", Name)
 	}
 	return results, nil
 }
 
-func (m *MissAV) parseMovieInfo(body []byte, id, homepage string) (*model.MovieInfo, error) {
+func (m *MissAV) parseMovieInfo(base *url.URL, body []byte, id,
+	homepage string) (*model.MovieInfo, error) {
 	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%s: parse detail response: %w", Name, err)
@@ -261,10 +323,11 @@ func (m *MissAV) parseMovieInfo(body []byte, id, homepage string) (*model.MovieI
 		info.Title = firstAttr(doc.Find(`meta[property="og:title"]`).First(), "content")
 	}
 
-	info.CoverURL = m.absoluteURL(firstAttr(doc.Find(`meta[property="og:image"]`).First(), "content"))
+	info.CoverURL = m.absoluteURL(base,
+		firstAttr(doc.Find(`meta[property="og:image"]`).First(), "content"))
 	video := doc.Find("video.player").First()
 	if info.CoverURL == "" {
-		info.CoverURL = m.absoluteURL(firstAttr(video, "data-poster", "poster"))
+		info.CoverURL = m.absoluteURL(base, firstAttr(video, "data-poster", "poster"))
 	}
 	info.ThumbURL = info.CoverURL
 
@@ -320,7 +383,7 @@ func (m *MissAV) parseMovieInfo(body []byte, id, homepage string) (*model.MovieI
 		doc.Find(`meta[property="og:video:duration"]`).First(), "content")); duration > 0 {
 		info.Runtime = duration / 60
 	}
-	info.PreviewVideoURL = m.absoluteURL(firstAttr(doc.Find(
+	info.PreviewVideoURL = m.absoluteURL(base, firstAttr(doc.Find(
 		"video.player source, video.player").First(), "data-src", "src"))
 	if !isHTTPURL(info.PreviewVideoURL) {
 		info.PreviewVideoURL = previewURLFromCover(info.CoverURL)
@@ -355,7 +418,7 @@ func (m *MissAV) isSiteHost(host string) bool {
 	return false
 }
 
-func (m *MissAV) absoluteURL(rawURL string) string {
+func (m *MissAV) absoluteURL(base *url.URL, rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" || strings.HasPrefix(strings.ToLower(rawURL), "data:") {
 		return ""
@@ -364,7 +427,30 @@ func (m *MissAV) absoluteURL(rawURL string) string {
 	if err != nil {
 		return ""
 	}
-	return m.URL().ResolveReference(u).String()
+	return base.ResolveReference(u).String()
+}
+
+func stopDomainFallback(err error) bool {
+	return errors.Is(err, provider.ErrInfoNotFound) ||
+		errors.Is(err, provider.ErrInvalidID) ||
+		errors.Is(err, provider.ErrInvalidKeyword)
+}
+
+func hasNoSearchResults(doc *goquery.Document) bool {
+	text := strings.ToLower(cleanText(doc.Text()))
+	for _, marker := range []string{
+		"no results",
+		"not found",
+		"見つかりませんでした",
+		"該当する作品はありません",
+		"検索結果がありません",
+		"0件",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func isHTTPURL(rawURL string) bool {

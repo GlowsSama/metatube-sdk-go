@@ -102,6 +102,20 @@ type FlareSolverrSetter interface {
 	SetFlareSolverr(endpoint string) error
 }
 
+type DomainSetter interface {
+	// SetBackupDomains configures fallback domains in priority order.
+	SetBackupDomains(domains []string) error
+
+	// Domains returns the primary domain followed by configured backups.
+	Domains() []string
+}
+
+type URLMatcher interface {
+	// MatchesURL reports whether the URL belongs to this provider, including
+	// any runtime-configured fallback domains.
+	MatchesURL(u *url.URL) bool
+}
+
 type Config interface {
 	Has(string) bool
 	GetString(string) (string, error)
