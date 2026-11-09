@@ -163,6 +163,35 @@ func TestJavDB_FallsBackToConfiguredDomain(t *testing.T) {
 	assert.Equal(t, "Backup1", id)
 }
 
+func TestJavDB_FallsBackAfterLoginRequired(t *testing.T) {
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `<html><head><title>登入 - JavDB</title></head><body><form action="/login"></form></body></html>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search":
+			fmt.Fprint(w, `<div class="movie-list">`+
+				card("Backup1", "SONE-065", "Backup title", "/backup-cover.jpg")+`</div>`)
+		case "/v/Backup1":
+			fmt.Fprint(w, detailPage("SONE-065", "Backup title", "/backup-cover.jpg"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(backup.Close)
+
+	jav := New()
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
+
+	info, err := jav.GetMovieInfoByID("SONE-065")
+	require.NoError(t, err)
+	assert.Equal(t, "Backup title", info.Title)
+	assert.Equal(t, backup.URL+"/v/Backup1", info.Homepage)
+}
+
 func TestJavDB_DoesNotFallbackAfterNormalEmptySearch(t *testing.T) {
 	var backupHits int
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

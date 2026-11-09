@@ -502,6 +502,9 @@ func isSiteHost(host string) bool {
 }
 
 func stopDomainFallback(err error) bool {
+	// A normal lookup miss is authoritative for the current query. Login pages,
+	// HTTP errors, anti-bot challenges and geo restrictions are domain-specific,
+	// so those errors continue through the bounded backup-domain pool.
 	return errors.Is(err, provider.ErrInfoNotFound) ||
 		errors.Is(err, provider.ErrInvalidID) ||
 		errors.Is(err, provider.ErrInvalidKeyword)
