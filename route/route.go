@@ -60,6 +60,7 @@ func New(app *engine.Engine, v auth.Validator) *gin.Engine {
 		{
 			config.PUT("/flaresolverr", setFlareSolverr(app))
 			config.PUT("/domains", setDomains(app))
+			config.PUT("/javdb-session", setJavDBSession(app))
 		}
 
 		db := private.Group("/db")

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gocolly/colly/v2"
@@ -24,18 +26,19 @@ import (
 )
 
 var (
-	_ provider.MovieProvider = (*JavDB)(nil)
-	_ provider.MovieSearcher = (*JavDB)(nil)
-	_ provider.Fetcher       = (*JavDB)(nil)
-	_ provider.DomainSetter  = (*JavDB)(nil)
-	_ provider.URLMatcher    = (*JavDB)(nil)
+	_ provider.MovieProvider     = (*JavDB)(nil)
+	_ provider.MovieSearcher     = (*JavDB)(nil)
+	_ provider.Fetcher           = (*JavDB)(nil)
+	_ provider.DomainSetter      = (*JavDB)(nil)
+	_ provider.URLMatcher        = (*JavDB)(nil)
+	_ provider.SessionConfigurer = (*JavDB)(nil)
 
 	scorePattern        = regexp.MustCompile(`\d+(?:\.\d+)?`)
 	idPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 	upperNumberPattern  = regexp.MustCompile(`^[A-Z]{1,10}\d{2,}$`)
 	numericPattern      = regexp.MustCompile(`^\d+$`)
 	fc2AttemptPattern   = regexp.MustCompile(`(?i)^FC2(?:[-_\s]?PPV)?[-_\s]?\d`)
-	errLoginRequired    = errors.New("JavDB login required")
+	errLoginRequired    = errors.New("JavDB login required; configure a JavDB cookie or account")
 	errGeoRestricted    = errors.New("JavDB is unavailable in the current network region")
 	errAntiBotChallenge = errors.New("JavDB returned an anti-bot challenge")
 )
@@ -52,7 +55,8 @@ const (
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
-	domains *domainpool.Pool
+	domains   *domainpool.Pool
+	sessionMu sync.Mutex
 }
 
 func New() *JavDB {
@@ -73,6 +77,56 @@ func (jav *JavDB) SetBackupDomains(domains []string) error {
 
 func (jav *JavDB) Domains() []string {
 	return jav.domains.Domains(jav.URL())
+}
+
+// ConfigureSession applies a JavDB browser cookie or attempts a password
+// login. JavDB may require an image captcha, which this client cannot solve.
+func (jav *JavDB) ConfigureSession(username, password, cookie string) (provider.SessionStatus, error) {
+	username = strings.TrimSpace(username)
+	cookie = strings.TrimSpace(cookie)
+
+	jav.sessionMu.Lock()
+	defer jav.sessionMu.Unlock()
+
+	if username == "" && password == "" && cookie == "" {
+		if err := jav.clearSessionCookies(); err != nil {
+			return provider.SessionStatus{}, err
+		}
+		return provider.SessionStatus{
+			Configured: false,
+			Mode:       "none",
+			Message:    "JavDB 登录信息已清除",
+		}, nil
+	}
+
+	if err := jav.clearSessionCookies(); err != nil {
+		return provider.SessionStatus{}, err
+	}
+
+	if cookie != "" {
+		cookies, err := parseCookieHeader(cookie)
+		if err != nil {
+			return provider.SessionStatus{}, err
+		}
+		if err := jav.applySessionCookies(cookies); err != nil {
+			return provider.SessionStatus{}, err
+		}
+		return provider.SessionStatus{
+			Configured:    true,
+			Authenticated: true,
+			Mode:          "cookie",
+			Message:       "JavDB Cookie 已应用；如果已过期，请重新从浏览器获取",
+		}, nil
+	}
+
+	if username == "" || password == "" {
+		return provider.SessionStatus{
+			Configured: false,
+			Mode:       "password",
+			Message:    "JavDB 账号和密码需要同时填写",
+		}, nil
+	}
+	return jav.loginWithPassword(username, password)
 }
 
 func (jav *JavDB) MatchesURL(u *url.URL) bool {
@@ -294,6 +348,168 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 		return nil, fmt.Errorf("%s: empty response", jav.Name())
 	}
 	return body, nil
+}
+
+func (jav *JavDB) clearSessionCookies() error {
+	for _, domain := range jav.Domains() {
+		if err := jav.ResetCookies(domain); err != nil {
+			return fmt.Errorf("%s: clear cookies for %s: %w", jav.Name(), domain, err)
+		}
+	}
+	return nil
+}
+
+func (jav *JavDB) applySessionCookies(cookies []*http.Cookie) error {
+	for _, domain := range jav.Domains() {
+		hostCookies := make([]*http.Cookie, 0, len(cookies))
+		for _, cookie := range cookies {
+			if cookie == nil || cookie.Name == "" {
+				continue
+			}
+			item := *cookie
+			item.Domain = ""
+			if item.Path == "" {
+				item.Path = "/"
+			}
+			hostCookies = append(hostCookies, &item)
+		}
+		if err := jav.SetCookies(domain, hostCookies); err != nil {
+			return fmt.Errorf("%s: set cookies for %s: %w", jav.Name(), domain, err)
+		}
+	}
+	return nil
+}
+
+func (jav *JavDB) loginWithPassword(username, password string) (provider.SessionStatus, error) {
+	base := jav.URL()
+	signinURL := base.ResolveReference(&url.URL{Path: "/login"}).String()
+	body, err := jav.fetchPage(signinURL)
+	if err != nil {
+		return provider.SessionStatus{}, err
+	}
+
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return provider.SessionStatus{}, fmt.Errorf("%s: parse sign-in page: %w", jav.Name(), err)
+	}
+	if !isLoginDocument(doc) {
+		return provider.SessionStatus{
+			Configured: true,
+			Mode:       "password",
+			Message:    "JavDB 未显示登录表单，可能当前会话已经登录",
+		}, nil
+	}
+	if hasCaptcha(doc) {
+		return provider.SessionStatus{
+			Configured: true,
+			Mode:       "password",
+			Message:    "JavDB 要求图片验证码，账号密码无法自动完成登录；请从已登录浏览器填写 Cookie",
+		}, nil
+	}
+
+	csrf := strings.TrimSpace(doc.Find(`meta[name="csrf-token"]`).First().AttrOr("content", ""))
+	if csrf == "" {
+		csrf = strings.TrimSpace(doc.Find(
+			`input[name="_csrf"], input[name="authenticity_token"], input[name="csrf-token"]`,
+		).First().AttrOr("value", ""))
+	}
+	if csrf == "" {
+		return provider.SessionStatus{
+			Configured: true,
+			Mode:       "password",
+			Message:    "JavDB 登录页未提供 CSRF 令牌，无法提交账号密码",
+		}, nil
+	}
+
+	action := strings.TrimSpace(doc.Find(
+		`form[action*="/auth/signin"], form[action*="/auth/login"], form[action*="/login"], form[action*="sign_in"]`,
+	).First().AttrOr("action", ""))
+	if action == "" {
+		action = "/auth/signin"
+	}
+	actionURL, err := url.Parse(action)
+	if err != nil {
+		return provider.SessionStatus{}, fmt.Errorf("%s: parse sign-in form action: %w", jav.Name(), err)
+	}
+	actionURL = base.ResolveReference(actionURL)
+
+	body, status, err := jav.postSignin(actionURL.String(), signinURL, csrf, username, password)
+	if err != nil {
+		return provider.SessionStatus{
+			Configured: true,
+			Mode:       "password",
+			Message:    fmt.Sprintf("JavDB 登录请求失败：%v", err),
+		}, nil
+	}
+	if status >= http.StatusBadRequest {
+		return provider.SessionStatus{
+			Configured: true,
+			Mode:       "password",
+			Message:    fmt.Sprintf("JavDB 登录请求返回 HTTP %d", status),
+		}, nil
+	}
+
+	doc, err = goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return provider.SessionStatus{}, fmt.Errorf("%s: parse sign-in response: %w", jav.Name(), err)
+	}
+	if isLoginDocument(doc) {
+		message := "JavDB 账号或密码未被接受"
+		if hasCaptcha(doc) {
+			message = "JavDB 要求图片验证码，账号密码无法自动完成登录；请从已登录浏览器填写 Cookie"
+		}
+		return provider.SessionStatus{
+			Configured: true,
+			Mode:       "password",
+			Message:    message,
+		}, nil
+	}
+	return provider.SessionStatus{
+		Configured:    true,
+		Authenticated: true,
+		Mode:          "password",
+		Message:       "JavDB 账号密码登录成功",
+	}, nil
+}
+
+func (jav *JavDB) postSignin(actionURL, refererURL, csrf, username, password string) ([]byte, int, error) {
+	c := jav.ClonedCollector()
+	var (
+		body           []byte
+		responseStatus int
+		responseErr    error
+	)
+	c.OnRequest(func(r *colly.Request) {
+		r.Headers.Set("X-CSRF-Token", csrf)
+		r.Headers.Set("Referer", refererURL)
+		if u, err := url.Parse(refererURL); err == nil && u.Host != "" {
+			r.Headers.Set("Origin", (&url.URL{Scheme: u.Scheme, Host: u.Host}).String())
+		}
+	})
+	c.OnResponse(func(r *colly.Response) {
+		body = append([]byte(nil), r.Body...)
+		responseStatus = r.StatusCode
+	})
+	c.OnError(func(r *colly.Response, err error) {
+		if r != nil {
+			if len(r.Body) > 0 {
+				body = append([]byte(nil), r.Body...)
+			}
+			responseStatus = r.StatusCode
+		}
+		responseErr = err
+	})
+
+	if err := c.Post(actionURL, map[string]string{
+		"page":       "1",
+		"email":      username,
+		"password":   password,
+		"_rucaptcha": "",
+		"remember":   "1",
+	}); err != nil && responseErr == nil {
+		responseErr = err
+	}
+	return body, responseStatus, responseErr
 }
 
 func (jav *JavDB) parseSearchResults(base *url.URL, body []byte) ([]*model.MovieSearchResult, error) {
@@ -559,10 +775,31 @@ func detectPageError(body []byte) error {
 
 func isLoginDocument(doc *goquery.Document) bool {
 	title := strings.ToLower(cleanText(doc.Find("title").First().Text()))
-	return doc.Find(`form[action*="/login"], form[action*="sign_in"]`).Length() > 0 ||
+	return doc.Find(`form[action*="/auth/signin"], form[action*="/auth/login"], form[action*="/login"], form[action*="sign_in"]`).Length() > 0 ||
 		strings.Contains(title, "登入") ||
 		strings.Contains(title, "登录") ||
-		strings.Contains(title, "login")
+		strings.Contains(title, "login") ||
+		strings.Contains(title, "sign in")
+}
+
+func hasCaptcha(doc *goquery.Document) bool {
+	return doc.Find(`img[src*="rucaptcha"], input[name="_rucaptcha"], script[src*="rucaptcha"]`).Length() > 0
+}
+
+func parseCookieHeader(raw string) ([]*http.Cookie, error) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) >= len("Cookie:") && strings.EqualFold(raw[:len("Cookie:")], "Cookie:") {
+		raw = strings.TrimSpace(raw[len("Cookie:"):])
+	}
+	if raw == "" {
+		return nil, fmt.Errorf("empty JavDB cookie")
+	}
+	req := &http.Request{Header: http.Header{"Cookie": []string{raw}}}
+	cookies := req.Cookies()
+	if len(cookies) == 0 {
+		return nil, fmt.Errorf("JavDB cookie is not a valid Cookie header")
+	}
+	return cookies, nil
 }
 
 func hasNoResults(doc *goquery.Document) bool {

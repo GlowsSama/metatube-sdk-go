@@ -86,6 +86,25 @@ func (s *Scraper) ParseActorIDFromURL(string) (string, error) { panic("unimpleme
 // ClonedCollector returns cloned internal collector.
 func (s *Scraper) ClonedCollector() *colly.Collector { return s.c.Clone() }
 
+// SetCookies adds cookies to the shared browser session for rawURL.
+func (s *Scraper) SetCookies(rawURL string, cookies []*http.Cookie) error {
+	return s.c.SetCookies(rawURL, cookies)
+}
+
+// ResetCookies expires all cookies currently stored for rawURL.
+func (s *Scraper) ResetCookies(rawURL string) error {
+	cookies := s.c.Cookies(rawURL)
+	if len(cookies) == 0 {
+		return nil
+	}
+	for _, cookie := range cookies {
+		cookie.Value = ""
+		cookie.MaxAge = -1
+		cookie.Expires = time.Unix(1, 0)
+	}
+	return s.c.SetCookies(rawURL, cookies)
+}
+
 // SetProxy sets http or socks5 proxy for HTTP requests.
 func (s *Scraper) SetProxy(proxyURL string) error {
 	if !strings.Contains(proxyURL, "://") {

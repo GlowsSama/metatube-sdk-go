@@ -34,6 +34,7 @@ type apiRequest struct {
 	URL        string            `json:"url"`
 	MaxTimeout int64             `json:"maxTimeout"`
 	Headers    map[string]string `json:"headers,omitempty"`
+	PostData   string            `json:"postData,omitempty"`
 }
 
 type apiResponse struct {
@@ -117,7 +118,7 @@ func (c *Client) SetTimeout(timeout time.Duration) {
 
 // Get solves a GET request and returns the rendered response body.
 func (c *Client) Get(ctx context.Context, target string, headers http.Header) ([]byte, error) {
-	solution, err := c.solve(ctx, http.MethodGet, target, headers)
+	solution, err := c.solve(ctx, http.MethodGet, target, headers, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +128,8 @@ func (c *Client) Get(ctx context.Context, target string, headers http.Header) ([
 	return []byte(solution.Response), nil
 }
 
-func (c *Client) solve(ctx context.Context, method, target string, headers http.Header) (*solution, error) {
+func (c *Client) solve(ctx context.Context, method, target string, headers http.Header,
+	postData []byte) (*solution, error) {
 	c.mu.RLock()
 	httpClient := c.httpClient
 	timeout := c.timeout
@@ -143,15 +145,21 @@ func (c *Client) solve(ctx context.Context, method, target string, headers http.
 		return nil, fmt.Errorf("FlareSolverr request deadline exceeded")
 	}
 
-	cmd := "request.get"
-	if method == http.MethodPost {
+	var cmd string
+	switch method {
+	case http.MethodGet:
+		cmd = "request.get"
+	case http.MethodPost:
 		cmd = "request.post"
+	default:
+		return nil, fmt.Errorf("FlareSolverr does not support HTTP method %s", method)
 	}
 	payload := apiRequest{
 		Cmd:        cmd,
 		URL:        target,
 		MaxTimeout: maxTimeout.Milliseconds(),
 		Headers:    solverHeaders(headers),
+		PostData:   string(postData),
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -200,7 +208,7 @@ func solverHeaders(headers http.Header) map[string]string {
 			continue
 		}
 		switch strings.ToLower(key) {
-		case "connection", "content-length", "cookie", "host", "proxy-connection",
+		case "connection", "content-length", "host", "proxy-connection",
 			"te", "trailer", "transfer-encoding", "upgrade":
 			continue
 		default:
@@ -293,6 +301,18 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header = req.Header.Clone()
 		req.Header.Set("User-Agent", userAgent)
 	}
+
+	var requestBody []byte
+	if req.Body != nil {
+		var err error
+		requestBody, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read request body: %w", err)
+		}
+		_ = req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(requestBody))
+	}
+
 	resp, err := base.RoundTrip(req)
 	if err != nil || solver == nil ||
 		(req.Method != http.MethodGet && req.Method != http.MethodPost) {
@@ -305,7 +325,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if resp.Body != nil {
 		_ = resp.Body.Close()
 	}
-	solved, err := solver.solve(req.Context(), req.Method, req.URL.String(), req.Header)
+	solved, err := solver.solve(req.Context(), req.Method, req.URL.String(), req.Header, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("solve %s with FlareSolverr: %w", req.URL, err)
 	}

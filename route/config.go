@@ -17,6 +17,12 @@ type domainsConfig struct {
 	Providers map[string][]string `json:"providers" binding:"required"`
 }
 
+type javDBSessionConfig struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Cookie   string `json:"cookie"`
+}
+
 func setFlareSolverr(app *engine.Engine) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		config := &flareSolverrConfig{}
@@ -67,5 +73,22 @@ func setDomains(app *engine.Engine) gin.HandlerFunc {
 		c.JSON(http.StatusOK, &responseMessage{
 			Data: gin.H{"providers": normalized},
 		})
+	}
+}
+
+func setJavDBSession(app *engine.Engine) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		config := &javDBSessionConfig{}
+		if err := c.ShouldBindJSON(config); err != nil {
+			abortWithStatusMessage(c, http.StatusBadRequest, err)
+			return
+		}
+
+		status, err := app.SetJavDBSession(config.Username, config.Password, config.Cookie)
+		if err != nil {
+			abortWithStatusMessage(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, &responseMessage{Data: status})
 	}
 }
