@@ -24,9 +24,14 @@ import (
 
 func newTestProvider(t *testing.T, handler http.HandlerFunc) *JavDB {
 	t.Helper()
+	return newTestProviderWithInterval(t, handler, 0)
+}
+
+func newTestProviderWithInterval(t *testing.T, handler http.HandlerFunc, interval time.Duration) *JavDB {
+	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	jav := New()
+	jav := newJavDB(interval)
 	jav.Scraper = scraper.NewDefaultScraper(Name, server.URL, Priority, language.Chinese)
 	return jav
 }
@@ -147,7 +152,7 @@ func TestJavDB_FallsBackToConfiguredDomain(t *testing.T) {
 	}))
 	t.Cleanup(backup.Close)
 
-	jav := New()
+	jav := newJavDB(0)
 	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
 	require.NoError(t, jav.SetBackupDomains([]string{backup.URL + "/ignored-path"}))
 
@@ -182,7 +187,7 @@ func TestJavDB_FallsBackAfterLoginRequired(t *testing.T) {
 	}))
 	t.Cleanup(backup.Close)
 
-	jav := New()
+	jav := newJavDB(0)
 	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
 	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
 
@@ -206,7 +211,7 @@ func TestJavDB_DoesNotFallbackAfterNormalEmptySearch(t *testing.T) {
 	}))
 	t.Cleanup(backup.Close)
 
-	jav := New()
+	jav := newJavDB(0)
 	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
 	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
 
@@ -214,6 +219,94 @@ func TestJavDB_DoesNotFallbackAfterNormalEmptySearch(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, results)
 	assert.Zero(t, backupHits)
+}
+
+func TestJavDB_StopsFallbackAfterForbidden(t *testing.T) {
+	var primaryHits, backupHits int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backupHits++
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("backup", "SONE-065", "Unexpected fallback", "/cover.jpg")+`</div>`)
+	}))
+	t.Cleanup(backup.Close)
+
+	jav := newJavDB(0)
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
+
+	_, err := jav.SearchMovie("SONE-065")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errRateLimited)
+	assert.Equal(t, 1, primaryHits)
+	assert.Zero(t, backupHits)
+	assert.False(t, jav.rateLimitUntil.IsZero())
+
+	_, err = jav.SearchMovie("SONE-065")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errRateLimited)
+	assert.Equal(t, 1, primaryHits, "cooldown should suppress the second request")
+	assert.Zero(t, backupHits)
+}
+
+func TestJavDB_RetryAfterStopsFallback(t *testing.T) {
+	var primaryHits, backupHits int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backupHits++
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("backup", "SONE-065", "Unexpected fallback", "/cover.jpg")+`</div>`)
+	}))
+	t.Cleanup(backup.Close)
+
+	jav := newJavDB(0)
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
+
+	_, err := jav.SearchMovie("SONE-065")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errRateLimited)
+	assert.Equal(t, 1, primaryHits)
+	assert.Zero(t, backupHits)
+	assert.True(t, jav.rateLimitUntil.After(time.Now().Add(1500*time.Millisecond)))
+}
+
+func TestJavDB_StopsFallbackAfterCloudflareChallenge(t *testing.T) {
+	var primaryHits, backupHits int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		fmt.Fprint(w, `<html><title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/x"></script></html>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backupHits++
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("backup", "SONE-065", "Unexpected fallback", "/cover.jpg")+`</div>`)
+	}))
+	t.Cleanup(backup.Close)
+
+	jav := newJavDB(0)
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
+
+	_, err := jav.SearchMovie("SONE-065")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errAntiBotChallenge)
+	assert.Equal(t, 1, primaryHits)
+	assert.Zero(t, backupHits)
+	assert.False(t, jav.rateLimitUntil.IsZero())
 }
 
 func TestJavDB_DomainFallbackIsBounded(t *testing.T) {
@@ -232,7 +325,7 @@ func TestJavDB_DomainFallbackIsBounded(t *testing.T) {
 		t.Cleanup(server.Close)
 	}
 
-	jav := New()
+	jav := newJavDB(0)
 	jav.Scraper = scraper.NewDefaultScraper(Name, servers[0].URL, Priority, language.Chinese)
 	backups := make([]string, 0, len(servers)-1)
 	for _, server := range servers[1:] {
@@ -276,6 +369,59 @@ func TestJavDB_NumberLookupFetchesDetailPage(t *testing.T) {
 	assert.Equal(t, []string{jav.URL().String() + "/samples/1.jpg"}, []string(info.PreviewImages))
 	assert.Equal(t, 120, info.Runtime)
 	assert.InDelta(t, 4.7, info.Score, 0.001)
+}
+
+func TestJavDB_RequestIntervalAppliesToSearchDetailAndFallback(t *testing.T) {
+	const interval = 40 * time.Millisecond
+
+	type requestEvent struct {
+		name string
+		at   time.Time
+	}
+	events := make(chan requestEvent, 3)
+
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		events <- requestEvent{name: "primary-search", at: time.Now()}
+		fmt.Fprint(w, `<html><body>maintenance</body></html>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search":
+			events <- requestEvent{name: "backup-search", at: time.Now()}
+			fmt.Fprint(w, `<div class="movie-list">`+
+				card("Backup1", "SONE-065", "Backup title", "/backup-cover.jpg")+`</div>`)
+		case "/v/Backup1":
+			events <- requestEvent{name: "backup-detail", at: time.Now()}
+			fmt.Fprint(w, detailPage("SONE-065", "Backup title", "/backup-cover.jpg"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(backup.Close)
+
+	jav := newJavDB(interval)
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
+
+	info, err := jav.GetMovieInfoByID("SONE-065")
+	require.NoError(t, err)
+	assert.Equal(t, "Backup title", info.Title)
+
+	received := []requestEvent{
+		<-events,
+		<-events,
+		<-events,
+	}
+	assert.Equal(t, []string{"primary-search", "backup-search", "backup-detail"}, []string{
+		received[0].name,
+		received[1].name,
+		received[2].name,
+	})
+	for i := 1; i < len(received); i++ {
+		assert.GreaterOrEqual(t, received[i].at.Sub(received[i-1].at), interval-5*time.Millisecond)
+	}
 }
 
 func TestJavDB_DetailSlugAndSimplifiedLabels(t *testing.T) {
@@ -433,6 +579,7 @@ func TestJavDB_HTTPError(t *testing.T) {
 
 func TestJavDB_NormalizeMovieIDAndParseURL(t *testing.T) {
 	jav := New()
+	assert.Equal(t, 10*time.Second, jav.requestInterval)
 	for _, id := range []string{"3119569", "FC2-3119569", "fc2-ppv-3119569", "FC2PPV3119569"} {
 		assert.Equal(t, "3119569", jav.NormalizeMovieID(id))
 	}
@@ -482,10 +629,10 @@ func TestJavDB_TitleAndLazyImageFallback(t *testing.T) {
 }
 
 func TestJavDB_ConcurrentLookups(t *testing.T) {
-	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+	jav := newTestProviderWithInterval(t, func(w http.ResponseWriter, r *http.Request) {
 		number := r.URL.Query().Get("q")
 		fmt.Fprint(w, `<div class="movie-list">`+card("slug"+number, number, "Example", "/cover.jpg")+`</div>`)
-	})
+	}, 20*time.Millisecond)
 	var wg sync.WaitGroup
 	for _, id := range []string{"3119569", "3108774"} {
 		wg.Add(1)
@@ -524,7 +671,7 @@ func TestJavDB_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {
 	}))
 	t.Cleanup(flare.Close)
 
-	jav := New()
+	jav := newJavDB(0)
 	jav.Scraper = scraper.NewDefaultScraper(Name, target.URL, Priority, language.Chinese)
 	require.NoError(t, jav.SetFlareSolverr(flare.URL+"/v1"))
 
@@ -532,6 +679,16 @@ func TestJavDB_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Solved title", info.Title)
 	assert.Equal(t, target.URL+"/solved.jpg", info.CoverURL)
+	assert.True(t, jav.rateLimitUntil.IsZero(), "a solved challenge must not enter cooldown")
+}
+
+func TestJavDB_RetryAfterDelay(t *testing.T) {
+	assert.Equal(t, 2*time.Second, retryAfterDelay("2"))
+	assert.Zero(t, retryAfterDelay("not-a-delay"))
+
+	delay := retryAfterDelay(time.Now().Add(5 * time.Second).UTC().Format(http.TimeFormat))
+	assert.Greater(t, delay, 3*time.Second)
+	assert.LessOrEqual(t, delay, 6*time.Second)
 }
 
 func TestJavDB_LiveFlareSolverr(t *testing.T) {

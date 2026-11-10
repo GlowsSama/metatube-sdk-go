@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gocolly/colly/v2"
@@ -35,15 +38,20 @@ var (
 	upperNumberPattern  = regexp.MustCompile(`^[A-Z]{1,10}\d{2,}$`)
 	numericPattern      = regexp.MustCompile(`^\d+$`)
 	fc2AttemptPattern   = regexp.MustCompile(`(?i)^FC2(?:[-_\s]?PPV)?[-_\s]?\d`)
+	httpStatusPattern   = regexp.MustCompile(`HTTP ([1-5][0-9]{2})`)
 	errLoginRequired    = errors.New("JavDB login required")
 	errGeoRestricted    = errors.New("JavDB is unavailable in the current network region")
 	errAntiBotChallenge = errors.New("JavDB returned an anti-bot challenge")
+	errRateLimited      = errors.New("JavDB is temporarily rate limited")
 )
 
 const (
-	Name     = "JavDB"
-	Priority = 1000 - 10
-	baseURL  = "https://javdb.com/"
+	Name                   = "JavDB"
+	Priority               = 1000 - 10
+	baseURL                = "https://javdb.com/"
+	defaultRequestInterval = 10 * time.Second
+	defaultRateLimit       = 15 * time.Minute
+	maxRateLimit           = 24 * time.Hour
 )
 
 // JavDB provides public search and detail-page metadata. Detail-page IDs are
@@ -52,10 +60,22 @@ const (
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
-	domains *domainpool.Pool
+	domains         *domainpool.Pool
+	requestMu       sync.Mutex
+	requestInterval time.Duration
+	lastRequest     time.Time
+	rateLimitMu     sync.Mutex
+	rateLimitUntil  time.Time
+	rateLimitBlocks int
+	rateLimitBase   time.Duration
+	rateLimitMax    time.Duration
 }
 
 func New() *JavDB {
+	return newJavDB(defaultRequestInterval)
+}
+
+func newJavDB(requestInterval time.Duration) *JavDB {
 	return &JavDB{
 		Fetcher: fetch.Default(&fetch.Config{Referer: baseURL}),
 		Scraper: scraper.NewDefaultScraper(Name, baseURL, Priority, language.Chinese,
@@ -63,7 +83,10 @@ func New() *JavDB {
 				"Referer":         baseURL,
 				"Accept-Language": "zh-CN,zh;q=0.9",
 			})),
-		domains: domainpool.New(),
+		domains:         domainpool.New(),
+		requestInterval: requestInterval,
+		rateLimitBase:   defaultRateLimit,
+		rateLimitMax:    maxRateLimit,
 	}
 }
 
@@ -256,8 +279,10 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 	c := jav.ClonedCollector()
 
 	var (
-		body        []byte
-		responseErr error
+		body               []byte
+		responseErr        error
+		responseStatus     int
+		responseRetryAfter string
 	)
 	if u, err := url.Parse(rawURL); err == nil && u.Host != "" {
 		referer := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}).String()
@@ -267,33 +292,120 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 	}
 	c.OnResponse(func(r *colly.Response) {
 		body = append([]byte(nil), r.Body...)
+		responseStatus = r.StatusCode
+		responseRetryAfter = r.Headers.Get("Retry-After")
 	})
 	c.OnError(func(r *colly.Response, err error) {
+		if r == nil {
+			responseErr = fmt.Errorf("%s: request failed: %w", jav.Name(), err)
+			return
+		}
 		if len(r.Body) > 0 {
 			body = append([]byte(nil), r.Body...)
 		}
+		responseStatus = r.StatusCode
+		responseRetryAfter = r.Headers.Get("Retry-After")
 		responseErr = fmt.Errorf("%s: request failed with HTTP %d: %w", jav.Name(), r.StatusCode, err)
 	})
 
+	if err := jav.waitForRequestSlot(); err != nil {
+		return nil, err
+	}
 	visitErr := c.Visit(rawURL)
 	if len(body) > 0 {
 		if err := detectPageError(body); err != nil {
+			if errors.Is(err, errAntiBotChallenge) {
+				jav.recordRateLimit(0, "")
+			}
 			return nil, err
 		}
 	}
+	if responseErr != nil {
+		if isRateLimitStatus(responseStatus) {
+			jav.recordRateLimit(responseStatus, responseRetryAfter)
+			return nil, fmt.Errorf("%w: %v", errRateLimited, responseErr)
+		}
+		return nil, responseErr
+	}
 	if visitErr != nil {
-		if responseErr != nil {
-			return nil, responseErr
+		if status := statusFromError(visitErr); isRateLimitStatus(status) {
+			jav.recordRateLimit(status, "")
+			return nil, fmt.Errorf("%w: %v", errRateLimited, visitErr)
 		}
 		return nil, visitErr
-	}
-	if responseErr != nil {
-		return nil, responseErr
 	}
 	if len(body) == 0 {
 		return nil, fmt.Errorf("%s: empty response", jav.Name())
 	}
+	jav.clearRateLimit()
 	return body, nil
+}
+
+func (jav *JavDB) waitForRequestSlot() error {
+	if err := jav.rateLimitError(); err != nil {
+		return err
+	}
+
+	jav.requestMu.Lock()
+	defer jav.requestMu.Unlock()
+
+	if err := jav.rateLimitError(); err != nil {
+		return err
+	}
+	if jav.requestInterval <= 0 {
+		return nil
+	}
+	if !jav.lastRequest.IsZero() {
+		if delay := time.Until(jav.lastRequest.Add(jav.requestInterval)); delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+	jav.lastRequest = time.Now()
+	return nil
+}
+
+func (jav *JavDB) rateLimitError() error {
+	jav.rateLimitMu.Lock()
+	defer jav.rateLimitMu.Unlock()
+
+	if jav.rateLimitUntil.After(time.Now()) {
+		return fmt.Errorf("%w until %s", errRateLimited, jav.rateLimitUntil.Format(time.RFC3339))
+	}
+	return nil
+}
+
+func (jav *JavDB) recordRateLimit(status int, retryAfter string) {
+	jav.rateLimitMu.Lock()
+	defer jav.rateLimitMu.Unlock()
+
+	now := time.Now()
+	delay := retryAfterDelay(retryAfter)
+	if delay <= 0 {
+		if status == http.StatusTooManyRequests {
+			delay = jav.rateLimitBase
+		} else {
+			jav.rateLimitBlocks++
+			delay = jav.rateLimitBase
+			for i := 1; i < jav.rateLimitBlocks && delay < jav.rateLimitMax; i++ {
+				delay *= 2
+			}
+		}
+	}
+	if delay > jav.rateLimitMax {
+		delay = jav.rateLimitMax
+	}
+	until := now.Add(delay)
+	if until.After(jav.rateLimitUntil) {
+		jav.rateLimitUntil = until
+	}
+}
+
+func (jav *JavDB) clearRateLimit() {
+	jav.rateLimitMu.Lock()
+	defer jav.rateLimitMu.Unlock()
+
+	jav.rateLimitUntil = time.Time{}
+	jav.rateLimitBlocks = 0
 }
 
 func (jav *JavDB) parseSearchResults(base *url.URL, body []byte) ([]*model.MovieSearchResult, error) {
@@ -503,11 +615,15 @@ func isSiteHost(host string) bool {
 
 func stopDomainFallback(err error) bool {
 	// A normal lookup miss is authoritative for the current query. Login pages,
-	// HTTP errors, anti-bot challenges and geo restrictions are domain-specific,
-	// so those errors continue through the bounded backup-domain pool.
+	// HTTP errors and geo restrictions are domain-specific, so those errors
+	// continue through the bounded backup-domain pool. Rate limits and
+	// anti-bot challenges are shared by the exit IP, so trying another JavDB
+	// domain would only repeat the same request against the same quota.
 	return errors.Is(err, provider.ErrInfoNotFound) ||
 		errors.Is(err, provider.ErrInvalidID) ||
-		errors.Is(err, provider.ErrInvalidKeyword)
+		errors.Is(err, provider.ErrInvalidKeyword) ||
+		errors.Is(err, errRateLimited) ||
+		errors.Is(err, errAntiBotChallenge)
 }
 
 func detailSlugFromPath(urlPath string) (string, bool) {
@@ -555,6 +671,46 @@ func detectPageError(body []byte) error {
 	default:
 		return nil
 	}
+}
+
+func isRateLimitStatus(status int) bool {
+	switch status {
+	case http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
+func statusFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	match := httpStatusPattern.FindStringSubmatch(err.Error())
+	if len(match) != 2 {
+		return 0
+	}
+	status, _ := strconv.Atoi(match[1])
+	return status
+}
+
+func retryAfterDelay(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(retryAt); delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 func isLoginDocument(doc *goquery.Document) bool {
