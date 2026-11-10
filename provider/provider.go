@@ -102,6 +102,18 @@ type FlareSolverrSetter interface {
 	SetFlareSolverr(endpoint string) error
 }
 
+type SessionStatus struct {
+	Configured    bool   `json:"configured"`
+	Authenticated bool   `json:"authenticated"`
+	Mode          string `json:"mode"`
+	Message       string `json:"message"`
+}
+
+type SessionConfigurer interface {
+	// ConfigureSession applies an authenticated browsing session.
+	ConfigureSession(username, password, cookie string) (SessionStatus, error)
+}
+
 type DomainSetter interface {
 	// SetBackupDomains configures fallback domains in priority order.
 	SetBackupDomains(domains []string) error

@@ -39,6 +39,19 @@ type domainsResponse struct {
 	} `json:"error"`
 }
 
+type javDBSessionResponse struct {
+	Data struct {
+		Configured    bool   `json:"configured"`
+		Authenticated bool   `json:"authenticated"`
+		Mode          string `json:"mode"`
+		Message       string `json:"message"`
+	} `json:"data"`
+	Error struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
 func TestFlareSolverrConfig(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	app := engine.New(nil)
@@ -140,5 +153,59 @@ func TestDomainsConfig(t *testing.T) {
 		rec, response := send(`{"providers":{"FC2":["backup.example"]}}`, testToken)
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 		assert.Contains(t, response.Error.Message, "does not support custom domains")
+	})
+}
+
+func TestJavDBSessionConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	app := engine.New(nil)
+	router := route.New(app, auth.Token(testToken))
+
+	send := func(body, token string) (*httptest.ResponseRecorder, javDBSessionResponse) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPut, "/v1/config/javdb-session",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		var response javDBSessionResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &response))
+		return rec, response
+	}
+
+	t.Run("requires authentication", func(t *testing.T) {
+		rec, response := send(`{"cookie":"session=secret"}`, "")
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Equal(t, http.StatusUnauthorized, response.Error.Code)
+	})
+
+	t.Run("applies cookie without returning it", func(t *testing.T) {
+		rec, response := send(`{"cookie":"Cookie: session=secret; cf_clearance=token"}`, testToken)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.True(t, response.Data.Configured)
+		assert.True(t, response.Data.Authenticated)
+		assert.Equal(t, "cookie", response.Data.Mode)
+		assert.NotContains(t, rec.Body.String(), "session=secret")
+		assert.NotContains(t, rec.Body.String(), "cf_clearance=token")
+	})
+
+	t.Run("reports incomplete account configuration", func(t *testing.T) {
+		rec, response := send(`{"username":"user@example.com"}`, testToken)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.False(t, response.Data.Configured)
+		assert.Equal(t, "password", response.Data.Mode)
+		assert.Contains(t, response.Data.Message, "同时填写")
+		assert.NotContains(t, rec.Body.String(), "user@example.com")
+	})
+
+	t.Run("clears session", func(t *testing.T) {
+		rec, response := send(`{}`, testToken)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.False(t, response.Data.Configured)
+		assert.Equal(t, "none", response.Data.Mode)
 	})
 }

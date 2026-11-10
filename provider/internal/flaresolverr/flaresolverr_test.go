@@ -152,6 +152,59 @@ func TestTransportDetectsChallengePageWithHTTP200(t *testing.T) {
 	assert.Equal(t, "<html>solved after 200 challenge</html>", string(body))
 }
 
+func TestTransportReplaysPostBodyAndCookiesThroughFlareSolverr(t *testing.T) {
+	const requestBody = "email=user%40example.com&password=secret"
+	direct := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		require.NoError(t, err)
+		assert.Equal(t, requestBody, string(body))
+		resp := response(http.StatusForbidden, "")
+		resp.Header.Set("Cf-Mitigated", "challenge")
+		return resp, nil
+	})
+
+	var payload apiRequest
+	solver, err := NewClient("http://flaresolverr.local", 5*time.Second)
+	require.NoError(t, err)
+	solver.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		require.NoError(t, json.NewDecoder(req.Body).Decode(&payload))
+		return jsonResponse(apiResponse{
+			Status: "ok",
+			Solution: &solution{
+				Status:   http.StatusOK,
+				Response: "<html>signed in</html>",
+				Cookies: []cookie{{
+					Name:   "session",
+					Value:  "signed-in",
+					Domain: "javdb.com",
+					Path:   "/",
+				}},
+			},
+		}), nil
+	})
+
+	transport := NewTransport(direct)
+	transport.solver = solver
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, "https://javdb.com/auth/signin", strings.NewReader(requestBody))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Cookie", "csrf=token")
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, "<html>signed in</html>", string(body))
+	assert.Equal(t, "request.post", payload.Cmd)
+	assert.Equal(t, requestBody, payload.PostData)
+	assert.Equal(t, "application/x-www-form-urlencoded", payload.Headers["Content-Type"])
+	assert.Equal(t, "csrf=token", payload.Headers["Cookie"])
+	assert.Contains(t, resp.Header.Get("Set-Cookie"), "session=signed-in")
+}
+
 func TestTransportSurfacesFlareSolverrErrors(t *testing.T) {
 	direct := roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return response(http.StatusServiceUnavailable, ""), nil

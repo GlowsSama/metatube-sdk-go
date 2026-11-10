@@ -225,6 +225,31 @@ func (e *Engine) SetProviderDomains(name string, backups []string) ([]string, er
 	return domains, nil
 }
 
+// SetJavDBSession applies a cookie or account session to the JavDB provider.
+// Credentials are never written to the engine log.
+func (e *Engine) SetJavDBSession(username, password, cookie string) (mt.SessionStatus, error) {
+	provider, err := e.GetMovieProviderByName("JavDB")
+	if err != nil {
+		return mt.SessionStatus{}, err
+	}
+	configurer, ok := provider.(mt.SessionConfigurer)
+	if !ok {
+		return mt.SessionStatus{}, fmt.Errorf("provider %s does not support sessions", provider.Name())
+	}
+
+	status, err := configurer.ConfigureSession(username, password, cookie)
+	if err != nil {
+		return mt.SessionStatus{}, fmt.Errorf("configure %s session: %w", provider.Name(), err)
+	}
+	if status.Configured {
+		e.logger.Printf("Configured %s session: mode=%s authenticated=%t message=%s",
+			provider.Name(), status.Mode, status.Authenticated, status.Message)
+	} else {
+		e.logger.Printf("Cleared %s session", provider.Name())
+	}
+	return status, nil
+}
+
 // Fetch fetches content from url. If the provider
 // is nil, the default fetcher will be used.
 func (e *Engine) Fetch(url string, provider mt.Provider) (*http.Response, error) {

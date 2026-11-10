@@ -197,6 +197,99 @@ func TestJavDB_FallsBackAfterLoginRequired(t *testing.T) {
 	assert.Equal(t, backup.URL+"/v/Backup1", info.Homepage)
 }
 
+func TestJavDB_ConfigureSessionCookieAndClear(t *testing.T) {
+	var cookies []string
+	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		cookies = append(cookies, r.Header.Get("Cookie"))
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("cookie", "SONE-065", "Cookie session", "/cover.jpg")+`</div>`)
+	})
+
+	status, err := jav.ConfigureSession("", "", "Cookie: session=abc; cf_clearance=token")
+	require.NoError(t, err)
+	assert.True(t, status.Configured)
+	assert.True(t, status.Authenticated)
+	assert.Equal(t, "cookie", status.Mode)
+
+	_, err = jav.SearchMovie("SONE-065")
+	require.NoError(t, err)
+	require.Len(t, cookies, 1)
+	assert.Contains(t, cookies[0], "session=abc")
+	assert.Contains(t, cookies[0], "cf_clearance=token")
+
+	status, err = jav.ConfigureSession("", "", "")
+	require.NoError(t, err)
+	assert.False(t, status.Configured)
+	assert.Equal(t, "none", status.Mode)
+
+	_, err = jav.SearchMovie("SONE-065")
+	require.NoError(t, err)
+	require.Len(t, cookies, 2)
+	assert.Empty(t, cookies[1])
+}
+
+func TestJavDB_ConfigureSessionWithPassword(t *testing.T) {
+	var postHits int
+	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/login":
+			fmt.Fprint(w, `<html><head><meta name="csrf-token" content="csrf-123"></head><body>
+<form action="/auth/signin" method="post">
+<input name="email"><input name="password"><input name="remember">
+</form></body></html>`)
+		case r.Method == http.MethodPost && r.URL.Path == "/auth/signin":
+			postHits++
+			require.NoError(t, r.ParseForm())
+			assert.Equal(t, "user@example.com", r.Form.Get("email"))
+			assert.Equal(t, " secret-password ", r.Form.Get("password"))
+			assert.Equal(t, "1", r.Form.Get("remember"))
+			assert.Equal(t, "csrf-123", r.Header.Get("X-CSRF-Token"))
+			assert.Contains(t, r.Header.Get("Referer"), "/login")
+			assert.Contains(t, r.Header.Get("Origin"), "://")
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: "signed-in", Path: "/"})
+			fmt.Fprint(w, `<html><head><title>JavDB</title></head><body>signed in</body></html>`)
+		case r.URL.Path == "/search":
+			assert.Contains(t, r.Header.Get("Cookie"), "session=signed-in")
+			fmt.Fprint(w, `<div class="movie-list">`+
+				card("signed-in", "SONE-065", "Password session", "/cover.jpg")+`</div>`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	status, err := jav.ConfigureSession("user@example.com", " secret-password ", "")
+	require.NoError(t, err)
+	assert.True(t, status.Configured)
+	assert.True(t, status.Authenticated)
+	assert.Equal(t, "password", status.Mode)
+	assert.Equal(t, 1, postHits)
+
+	_, err = jav.SearchMovie("SONE-065")
+	require.NoError(t, err)
+}
+
+func TestJavDB_ConfigureSessionStopsAtCaptcha(t *testing.T) {
+	var postHits int
+	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			postHits++
+		}
+		fmt.Fprint(w, `<html><head><meta name="csrf-token" content="csrf-123"></head><body>
+<form action="/auth/signin" method="post">
+<input name="email"><input name="password"><input name="_rucaptcha">
+<img src="/rucaptcha/123">
+</form></body></html>`)
+	})
+
+	status, err := jav.ConfigureSession("user@example.com", "secret-password", "")
+	require.NoError(t, err)
+	assert.True(t, status.Configured)
+	assert.False(t, status.Authenticated)
+	assert.Equal(t, "password", status.Mode)
+	assert.Contains(t, status.Message, "图片验证码")
+	assert.Zero(t, postHits)
+}
+
 func TestJavDB_DoesNotFallbackAfterNormalEmptySearch(t *testing.T) {
 	var backupHits int
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
