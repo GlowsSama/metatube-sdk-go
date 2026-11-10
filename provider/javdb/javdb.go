@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gocolly/colly/v2"
@@ -41,12 +42,20 @@ var (
 	errLoginRequired    = errors.New("JavDB login required; configure a JavDB cookie or account")
 	errGeoRestricted    = errors.New("JavDB is unavailable in the current network region")
 	errAntiBotChallenge = errors.New("JavDB returned an anti-bot challenge")
+	errDomainCooldown   = errors.New("JavDB request cooldown is active")
+	domainCooldowns     = [...]time.Duration{
+		15 * time.Minute,
+		30 * time.Minute,
+		time.Hour,
+		2 * time.Hour,
+	}
 )
 
 const (
-	Name     = "JavDB"
-	Priority = 1000 - 10
-	baseURL  = "https://javdb.com/"
+	Name              = "JavDB"
+	Priority          = 1000 - 10
+	baseURL           = "https://javdb.com/"
+	maxDomainAttempts = 3
 )
 
 // JavDB provides public search and detail-page metadata. Detail-page IDs are
@@ -55,8 +64,12 @@ const (
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
-	domains   *domainpool.Pool
-	sessionMu sync.Mutex
+	domains             *domainpool.Pool
+	sessionMu           sync.Mutex
+	domainPolicyMu      sync.Mutex
+	domainFailureRounds int
+	domainCooldownUntil time.Time
+	now                 func() time.Time
 }
 
 func New() *JavDB {
@@ -68,11 +81,19 @@ func New() *JavDB {
 				"Accept-Language": "zh-CN,zh;q=0.9",
 			})),
 		domains: domainpool.New(),
+		now:     time.Now,
 	}
 }
 
 func (jav *JavDB) SetBackupDomains(domains []string) error {
-	return jav.domains.SetBackups(domains)
+	if err := jav.domains.SetBackups(domains); err != nil {
+		return err
+	}
+
+	jav.domainPolicyMu.Lock()
+	jav.clearDomainFailuresLocked()
+	jav.domainPolicyMu.Unlock()
+	return nil
 }
 
 func (jav *JavDB) Domains() []string {
@@ -194,26 +215,12 @@ func (jav *JavDB) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
 		return nil, provider.ErrInvalidID
 	}
 
-	var lastErr error
-	for _, base := range jav.domains.Candidates(jav.URL()) {
-		var (
-			info *model.MovieInfo
-			err  error
-		)
+	return executeWithDomainPolicy(jav, func(base *url.URL) (*model.MovieInfo, error) {
 		if isNumberLike(id) {
-			info, err = jav.getMovieInfoByNumber(base, id)
-		} else {
-			info, err = jav.getMovieInfoByDetailURL(base, jav.detailURL(base, id), id)
+			return jav.getMovieInfoByNumber(base, id)
 		}
-		if err == nil {
-			return info, nil
-		}
-		if stopDomainFallback(err) {
-			return nil, err
-		}
-		lastErr = err
-	}
-	return nil, lastErr
+		return jav.getMovieInfoByDetailURL(base, jav.detailURL(base, id), id)
+	})
 }
 
 func (jav *JavDB) NormalizeMovieKeyword(keyword string) string {
@@ -240,19 +247,75 @@ func (jav *JavDB) SearchMovie(keyword string) ([]*model.MovieSearchResult, error
 		return nil, provider.ErrInvalidKeyword
 	}
 
-	var lastErr error
-	for _, base := range jav.domains.Candidates(jav.URL()) {
+	return executeWithDomainPolicy(jav, func(base *url.URL) ([]*model.MovieSearchResult, error) {
 		results, err := jav.searchMovie(base, keyword)
 		if err != nil {
-			if stopDomainFallback(err) {
-				return nil, err
-			}
-			lastErr = err
-			continue
+			return nil, err
 		}
 		return jav.filterSearchResults(results, keyword), nil
+	})
+}
+
+func executeWithDomainPolicy[T any](
+	jav *JavDB,
+	operation func(base *url.URL) (T, error),
+) (T, error) {
+	jav.domainPolicyMu.Lock()
+	defer jav.domainPolicyMu.Unlock()
+
+	now := time.Now
+	if jav.now != nil {
+		now = jav.now
 	}
-	return nil, lastErr
+	currentTime := now()
+	if jav.domainCooldownUntil.After(currentTime) {
+		var zero T
+		return zero, fmt.Errorf("%w until %s", errDomainCooldown,
+			jav.domainCooldownUntil.Format(time.RFC3339))
+	}
+
+	var lastErr error
+	for _, base := range jav.domains.Candidates(jav.URL()) {
+		for attempt := 0; attempt < maxDomainAttempts; attempt++ {
+			value, err := operation(base)
+			if err == nil {
+				jav.clearDomainFailuresLocked()
+				return value, nil
+			}
+			if stopDomainFallback(err) {
+				jav.clearDomainFailuresLocked()
+				var zero T
+				return zero, err
+			}
+
+			lastErr = err
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("JavDB: no domains available")
+	}
+	jav.startDomainCooldownLocked(currentTime)
+
+	var zero T
+	return zero, fmt.Errorf("%w until %s (last error: %w)", errDomainCooldown,
+		jav.domainCooldownUntil.Format(time.RFC3339), lastErr)
+}
+
+func (jav *JavDB) clearDomainFailuresLocked() {
+	jav.domainFailureRounds = 0
+	jav.domainCooldownUntil = time.Time{}
+}
+
+func (jav *JavDB) startDomainCooldownLocked(now time.Time) {
+	index := jav.domainFailureRounds
+	if index >= len(domainCooldowns) {
+		index = len(domainCooldowns) - 1
+	}
+	jav.domainCooldownUntil = now.Add(domainCooldowns[index])
+	if jav.domainFailureRounds < len(domainCooldowns) {
+		jav.domainFailureRounds++
+	}
 }
 
 func (jav *JavDB) searchMovie(base *url.URL, keyword string) ([]*model.MovieSearchResult, error) {
