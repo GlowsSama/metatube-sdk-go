@@ -8,10 +8,8 @@ import (
 	"sync"
 )
 
-const MaxDomains = 5
-
-// Pool stores bounded fallback domains for a provider. The provider's primary
-// domain is always supplied by the caller and remains first in the candidates.
+// Pool stores fallback domains for a provider. The provider's primary domain
+// is always supplied by the caller and remains first in the candidates.
 type Pool struct {
 	mu      sync.RWMutex
 	backups []*url.URL
@@ -42,10 +40,6 @@ func (p *Pool) SetBackups(values []string) error {
 			seen[key] = struct{}{}
 			backups = append(backups, u)
 		}
-	}
-
-	if len(backups)+1 > MaxDomains {
-		return fmt.Errorf("too many domains: at most %d total domains are allowed", MaxDomains)
 	}
 
 	p.mu.Lock()

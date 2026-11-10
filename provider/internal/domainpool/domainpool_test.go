@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPoolNormalizesDeduplicatesAndBoundsDomains(t *testing.T) {
+func TestPoolNormalizesDeduplicatesAndAcceptsUnlimitedDomains(t *testing.T) {
 	primary, err := url.Parse("https://javdb.com/")
 	require.NoError(t, err)
 
@@ -29,15 +29,23 @@ func TestPoolNormalizesDeduplicatesAndBoundsDomains(t *testing.T) {
 		"https://backup-four.example/",
 	}, pool.Domains(primary))
 
-	err = pool.SetBackups([]string{
+	require.NoError(t, pool.SetBackups([]string{
 		"backup-one.example",
 		"backup-two.example",
 		"backup-three.example",
 		"backup-four.example",
 		"backup-five.example",
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "at most 5 total domains")
+		"backup-six.example",
+	}))
+	assert.Equal(t, []string{
+		"https://javdb.com/",
+		"https://backup-one.example/",
+		"https://backup-two.example/",
+		"https://backup-three.example/",
+		"https://backup-four.example/",
+		"https://backup-five.example/",
+		"https://backup-six.example/",
+	}, pool.Domains(primary))
 }
 
 func TestPoolMatchesConfiguredHosts(t *testing.T) {

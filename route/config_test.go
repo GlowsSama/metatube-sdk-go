@@ -140,13 +140,13 @@ func TestDomainsConfig(t *testing.T) {
 			response.Data.Providers["MissAV"])
 	})
 
-	t.Run("rejects too many domains", func(t *testing.T) {
+	t.Run("accepts more than five total domains", func(t *testing.T) {
 		rec, response := send(
-			`{"providers":{"JavDB":["one.example","two.example","three.example","four.example","five.example"]}}`,
+			`{"providers":{"JavDB":["one.example","two.example","three.example","four.example","five.example","six.example"]}}`,
 			testToken,
 		)
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
-		assert.Contains(t, response.Error.Message, "at most 5 total domains")
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Len(t, response.Data.Providers["JavDB"], 7)
 	})
 
 	t.Run("rejects unsupported providers", func(t *testing.T) {
