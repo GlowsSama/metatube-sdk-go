@@ -128,8 +128,7 @@ func (c *Client) Get(ctx context.Context, target string, headers http.Header) ([
 	return []byte(solution.Response), nil
 }
 
-func (c *Client) solve(ctx context.Context, method, target string, headers http.Header,
-	postData []byte) (*solution, error) {
+func (c *Client) solve(ctx context.Context, method, target string, headers http.Header, postData []byte) (*solution, error) {
 	c.mu.RLock()
 	httpClient := c.httpClient
 	timeout := c.timeout
