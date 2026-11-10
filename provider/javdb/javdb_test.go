@@ -243,14 +243,14 @@ func TestJavDB_StopsFallbackAfterForbidden(t *testing.T) {
 	_, err := jav.SearchMovie("SONE-065")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errRateLimited)
-	assert.Equal(t, 1, primaryHits)
+	assert.Equal(t, 3, primaryHits)
 	assert.Zero(t, backupHits)
 	assert.False(t, jav.rateLimitUntil.IsZero())
 
 	_, err = jav.SearchMovie("SONE-065")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errRateLimited)
-	assert.Equal(t, 1, primaryHits, "cooldown should suppress the second request")
+	assert.Equal(t, 3, primaryHits, "cooldown should suppress the request after retries are exhausted")
 	assert.Zero(t, backupHits)
 }
 
@@ -271,13 +271,14 @@ func TestJavDB_RetryAfterStopsFallback(t *testing.T) {
 	t.Cleanup(backup.Close)
 
 	jav := newJavDB(0)
+	jav.retryWait = func(time.Duration) {}
 	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
 	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
 
 	_, err := jav.SearchMovie("SONE-065")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errRateLimited)
-	assert.Equal(t, 1, primaryHits)
+	assert.Equal(t, 3, primaryHits)
 	assert.Zero(t, backupHits)
 	assert.True(t, jav.rateLimitUntil.After(time.Now().Add(1500*time.Millisecond)))
 }
@@ -304,9 +305,83 @@ func TestJavDB_StopsFallbackAfterCloudflareChallenge(t *testing.T) {
 	_, err := jav.SearchMovie("SONE-065")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errAntiBotChallenge)
-	assert.Equal(t, 1, primaryHits)
+	assert.Equal(t, 3, primaryHits)
 	assert.Zero(t, backupHits)
 	assert.False(t, jav.rateLimitUntil.IsZero())
+}
+
+func TestJavDB_RetriesTransientFailures(t *testing.T) {
+	var primaryHits int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		if primaryHits < 3 {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("SONE-065", "SONE-065", "Recovered title", "/cover.jpg")+`</div>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	jav := newJavDB(0)
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+
+	results, err := jav.SearchMovie("SONE-065")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "Recovered title", results[0].Title)
+	assert.Equal(t, 3, primaryHits)
+	assert.True(t, jav.rateLimitUntil.IsZero(), "a later successful attempt must clear transient failures")
+}
+
+func TestJavDB_RetriesNetworkErrors(t *testing.T) {
+	var primaryHits int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		if primaryHits < 3 {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server does not support connection hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("hijack connection: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("SONE-065", "SONE-065", "Recovered after network errors", "/cover.jpg")+`</div>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	jav := newJavDB(0)
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+
+	results, err := jav.SearchMovie("SONE-065")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "Recovered after network errors", results[0].Title)
+	assert.Equal(t, 3, primaryHits)
+}
+
+func TestJavDB_DoesNotRetryGeoRestriction(t *testing.T) {
+	var primaryHits int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits++
+		fmt.Fprint(w, `<h1>Due to copyright restrictions, access to this site is prohibited in the country where your internet is located.</h1>`)
+	}))
+	t.Cleanup(primary.Close)
+
+	jav := newJavDB(0)
+	jav.Scraper = scraper.NewDefaultScraper(Name, primary.URL, Priority, language.Chinese)
+
+	_, err := jav.SearchMovie("SONE-065")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGeoRestricted)
+	assert.Equal(t, 1, primaryHits)
 }
 
 func TestJavDB_DomainFallbackIsBounded(t *testing.T) {
@@ -649,13 +724,16 @@ func TestJavDB_ConcurrentLookups(t *testing.T) {
 }
 
 func TestJavDB_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {
+	var targetHits, flareHits int
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHits++
 		w.Header().Set("Cf-Mitigated", "challenge")
 		w.WriteHeader(http.StatusForbidden)
 	}))
 	t.Cleanup(target.Close)
 
 	flare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flareHits++
 		var payload struct {
 			URL string `json:"url"`
 		}
@@ -679,6 +757,8 @@ func TestJavDB_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Solved title", info.Title)
 	assert.Equal(t, target.URL+"/solved.jpg", info.CoverURL)
+	assert.Equal(t, 1, targetHits)
+	assert.Equal(t, 1, flareHits)
 	assert.True(t, jav.rateLimitUntil.IsZero(), "a solved challenge must not enter cooldown")
 }
 

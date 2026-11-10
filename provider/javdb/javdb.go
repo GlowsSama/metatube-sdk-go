@@ -33,16 +33,17 @@ var (
 	_ provider.DomainSetter  = (*JavDB)(nil)
 	_ provider.URLMatcher    = (*JavDB)(nil)
 
-	scorePattern        = regexp.MustCompile(`\d+(?:\.\d+)?`)
-	idPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
-	upperNumberPattern  = regexp.MustCompile(`^[A-Z]{1,10}\d{2,}$`)
-	numericPattern      = regexp.MustCompile(`^\d+$`)
-	fc2AttemptPattern   = regexp.MustCompile(`(?i)^FC2(?:[-_\s]?PPV)?[-_\s]?\d`)
-	httpStatusPattern   = regexp.MustCompile(`HTTP ([1-5][0-9]{2})`)
-	errLoginRequired    = errors.New("JavDB login required")
-	errGeoRestricted    = errors.New("JavDB is unavailable in the current network region")
-	errAntiBotChallenge = errors.New("JavDB returned an anti-bot challenge")
-	errRateLimited      = errors.New("JavDB is temporarily rate limited")
+	scorePattern         = regexp.MustCompile(`\d+(?:\.\d+)?`)
+	idPattern            = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+	upperNumberPattern   = regexp.MustCompile(`^[A-Z]{1,10}\d{2,}$`)
+	numericPattern       = regexp.MustCompile(`^\d+$`)
+	fc2AttemptPattern    = regexp.MustCompile(`(?i)^FC2(?:[-_\s]?PPV)?[-_\s]?\d`)
+	httpStatusPattern    = regexp.MustCompile(`HTTP ([1-5][0-9]{2})`)
+	errLoginRequired     = errors.New("JavDB login required")
+	errGeoRestricted     = errors.New("JavDB is unavailable in the current network region")
+	errAntiBotChallenge  = errors.New("JavDB returned an anti-bot challenge")
+	errRateLimited       = errors.New("JavDB is temporarily rate limited")
+	errRateLimitCooldown = errors.New("JavDB request cooldown is active")
 )
 
 const (
@@ -52,6 +53,7 @@ const (
 	defaultRequestInterval = 10 * time.Second
 	defaultRateLimit       = 15 * time.Minute
 	maxRateLimit           = 24 * time.Hour
+	maxRequestRetries      = 2
 )
 
 // JavDB provides public search and detail-page metadata. Detail-page IDs are
@@ -69,6 +71,7 @@ type JavDB struct {
 	rateLimitBlocks int
 	rateLimitBase   time.Duration
 	rateLimitMax    time.Duration
+	retryWait       func(time.Duration)
 }
 
 func New() *JavDB {
@@ -87,6 +90,7 @@ func newJavDB(requestInterval time.Duration) *JavDB {
 		requestInterval: requestInterval,
 		rateLimitBase:   defaultRateLimit,
 		rateLimitMax:    maxRateLimit,
+		retryWait:       time.Sleep,
 	}
 }
 
@@ -276,6 +280,45 @@ func (jav *JavDB) getMovieInfoByDetailURL(base *url.URL, rawURL, id string) (*mo
 }
 
 func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
+	var (
+		lastErr             error
+		lastRateLimitStatus int
+		lastRetryAfter      string
+		sawRateLimit        bool
+	)
+	for attempt := 0; attempt <= maxRequestRetries; attempt++ {
+		body, status, retryAfter, err := jav.fetchPageOnce(rawURL)
+		if err == nil {
+			jav.clearRateLimit()
+			return body, nil
+		}
+		lastErr = err
+		if errors.Is(err, errRateLimitCooldown) {
+			return nil, err
+		}
+		if errors.Is(err, errRateLimited) || errors.Is(err, errAntiBotChallenge) {
+			sawRateLimit = true
+			lastRateLimitStatus = status
+			lastRetryAfter = retryAfter
+		}
+		if !isRetryablePageError(err) || attempt == maxRequestRetries {
+			break
+		}
+		if delay := retryAfterDelay(retryAfter); delay > 0 {
+			if jav.retryWait != nil {
+				jav.retryWait(delay)
+			} else {
+				time.Sleep(delay)
+			}
+		}
+	}
+	if sawRateLimit {
+		jav.recordRateLimit(lastRateLimitStatus, lastRetryAfter)
+	}
+	return nil, lastErr
+}
+
+func (jav *JavDB) fetchPageOnce(rawURL string) ([]byte, int, string, error) {
 	c := jav.ClonedCollector()
 
 	var (
@@ -304,41 +347,37 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 			body = append([]byte(nil), r.Body...)
 		}
 		responseStatus = r.StatusCode
-		responseRetryAfter = r.Headers.Get("Retry-After")
+		if r.Headers != nil {
+			responseRetryAfter = r.Headers.Get("Retry-After")
+		}
 		responseErr = fmt.Errorf("%s: request failed with HTTP %d: %w", jav.Name(), r.StatusCode, err)
 	})
 
 	if err := jav.waitForRequestSlot(); err != nil {
-		return nil, err
+		return nil, 0, "", err
 	}
 	visitErr := c.Visit(rawURL)
 	if len(body) > 0 {
 		if err := detectPageError(body); err != nil {
-			if errors.Is(err, errAntiBotChallenge) {
-				jav.recordRateLimit(0, "")
-			}
-			return nil, err
+			return nil, responseStatus, responseRetryAfter, err
 		}
 	}
 	if responseErr != nil {
 		if isRateLimitStatus(responseStatus) {
-			jav.recordRateLimit(responseStatus, responseRetryAfter)
-			return nil, fmt.Errorf("%w: %v", errRateLimited, responseErr)
+			return nil, responseStatus, responseRetryAfter, fmt.Errorf("%w: %v", errRateLimited, responseErr)
 		}
-		return nil, responseErr
+		return nil, responseStatus, responseRetryAfter, responseErr
 	}
 	if visitErr != nil {
 		if status := statusFromError(visitErr); isRateLimitStatus(status) {
-			jav.recordRateLimit(status, "")
-			return nil, fmt.Errorf("%w: %v", errRateLimited, visitErr)
+			return nil, status, "", fmt.Errorf("%w: %v", errRateLimited, visitErr)
 		}
-		return nil, visitErr
+		return nil, responseStatus, responseRetryAfter, visitErr
 	}
 	if len(body) == 0 {
-		return nil, fmt.Errorf("%s: empty response", jav.Name())
+		return nil, responseStatus, responseRetryAfter, fmt.Errorf("%s: empty response", jav.Name())
 	}
-	jav.clearRateLimit()
-	return body, nil
+	return body, responseStatus, responseRetryAfter, nil
 }
 
 func (jav *JavDB) waitForRequestSlot() error {
@@ -369,7 +408,7 @@ func (jav *JavDB) rateLimitError() error {
 	defer jav.rateLimitMu.Unlock()
 
 	if jav.rateLimitUntil.After(time.Now()) {
-		return fmt.Errorf("%w until %s", errRateLimited, jav.rateLimitUntil.Format(time.RFC3339))
+		return fmt.Errorf("%w: %w until %s", errRateLimited, errRateLimitCooldown, jav.rateLimitUntil.Format(time.RFC3339))
 	}
 	return nil
 }
@@ -680,6 +719,10 @@ func isRateLimitStatus(status int) bool {
 	default:
 		return false
 	}
+}
+
+func isRetryablePageError(err error) bool {
+	return !errors.Is(err, errGeoRestricted) && !errors.Is(err, errLoginRequired)
 }
 
 func statusFromError(err error) int {
