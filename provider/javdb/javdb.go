@@ -764,9 +764,12 @@ func detectPageError(body []byte) error {
 	switch {
 	case strings.Contains(lower, "access to this site is prohibited in the country"):
 		return fmt.Errorf("%w: copyright restriction", errGeoRestricted)
-	case strings.Contains(lower, "cf-chl"),
-		strings.Contains(lower, "challenge-platform"),
-		strings.Contains(lower, "just a moment"):
+	case strings.Contains(lower, "<title>just a moment...</title>"),
+		strings.Contains(lower, "<title>attention required! | cloudflare</title>"),
+		strings.Contains(lower, "cf-browser-verification"),
+		strings.Contains(lower, "__cf_chl_"),
+		strings.Contains(lower, `id="challenge-form"`),
+		strings.Contains(lower, `id='challenge-form'`):
 		return errAntiBotChallenge
 	default:
 		return nil

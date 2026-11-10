@@ -514,6 +514,26 @@ func TestJavDB_MissingOrIncompleteMetadata(t *testing.T) {
 	}
 }
 
+func TestJavDB_AcceptsNormalPageWithChallengePlatformScript(t *testing.T) {
+	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search":
+			fmt.Fprint(w, `<div class="movie-list">`+
+				card("AbC123", "SONE-065", "Example title", "/cover.jpg")+`</div>`)
+		case "/v/AbC123":
+			fmt.Fprint(w, detailPage("SONE-065", "Example title", "/cover.jpg")+
+				`<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	info, err := jav.GetMovieInfoByID("SONE-065")
+	require.NoError(t, err)
+	assert.Equal(t, "SONE-065", info.Number)
+	assert.Equal(t, "Example title", info.Title)
+}
+
 func TestJavDB_HTTPError(t *testing.T) {
 	jav := newTestProvider(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)

@@ -365,12 +365,12 @@ func isChallenge(resp *http.Response) bool {
 	}
 	lower := strings.ToLower(string(prefix))
 	for _, marker := range []string{
-		"just a moment...",
-		"attention required! | cloudflare",
+		"<title>just a moment...</title>",
+		"<title>attention required! | cloudflare</title>",
 		"cf-browser-verification",
-		"cf-chl",
-		"challenge-platform",
 		"__cf_chl_",
+		`id="challenge-form"`,
+		`id='challenge-form'`,
 	} {
 		if strings.Contains(lower, marker) {
 			return true

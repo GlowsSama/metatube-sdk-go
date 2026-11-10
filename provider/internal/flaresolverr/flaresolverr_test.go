@@ -95,7 +95,9 @@ func TestTransportFallsBackOnCloudflareChallenge(t *testing.T) {
 
 func TestTransportDoesNotCallFlareSolverrForNormalResponse(t *testing.T) {
 	direct := roundTripFunc(func(*http.Request) (*http.Response, error) {
-		resp := response(http.StatusOK, "<html>normal</html>")
+		resp := response(http.StatusOK, `<html><body>normal
+<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>
+</body></html>`)
 		resp.Header.Set("Content-Type", "text/html")
 		return resp, nil
 	})
@@ -117,7 +119,7 @@ func TestTransportDoesNotCallFlareSolverrForNormalResponse(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 
-	assert.Equal(t, "<html>normal</html>", string(body))
+	assert.Contains(t, string(body), "challenge-platform")
 	assert.False(t, called.Load())
 }
 
