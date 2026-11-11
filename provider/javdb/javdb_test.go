@@ -126,6 +126,48 @@ func TestJavDB_SearchMovieFiltersRelatedNumbers(t *testing.T) {
 	assert.Empty(t, results)
 }
 
+func TestJavDB_EquivalentMovieNumbers(t *testing.T) {
+	tests := []struct {
+		name     string
+		left     string
+		right    string
+		expected bool
+	}{
+		{name: "HEYZO leading zero", left: "HEYZO-0258", right: "HEYZO-258", expected: true},
+		{name: "SERO leading zero", left: "SERO-0170", right: "SERO-170", expected: true},
+		{name: "date separator", left: "052612_348", right: "052612-348", expected: true},
+		{name: "trailing suffix", left: "MXNB-001S", right: "MXNB-001S", expected: true},
+		{name: "compound number", left: "HEYDOUGA-4030-2133", right: "HEYDOUGA-4030-2133", expected: true},
+		{name: "alphanumeric number", left: "MKBD-S94", right: "MKBD-S94", expected: true},
+		{name: "suffix is significant", left: "MXNB-001S", right: "MXNB-001", expected: false},
+		{name: "compound suffix is significant", left: "HEYDOUGA-4030-2133", right: "HEYDOUGA-4030", expected: false},
+		{name: "date suffix is significant", left: "052612_348", right: "052612-349", expected: false},
+		{name: "related number", left: "SONE-065", right: "SONE-0651", expected: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.expected, equivalentMovieNumbers(test.left, test.right))
+		})
+	}
+}
+
+func TestJavDB_SearchMovieFiltersTitleResults(t *testing.T) {
+	const keyword = "IPZ-959 解禁！人生初 生中出しセックス 本物ザーメンを膣中に暴射！ 天海つばさ"
+	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, keyword, r.URL.Query().Get("q"))
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("match", "IPZ-959", keyword, "/match.jpg")+
+			card("unrelated", "ABCD-123", "まったく関係のない別の作品", "/unrelated.jpg")+`</div>`)
+	})
+
+	results, err := jav.SearchMovie(keyword)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "IPZ-959", results[0].Number)
+	assert.Equal(t, "match", results[0].ID)
+}
+
 func TestJavDB_FallsBackToConfiguredDomain(t *testing.T) {
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, `<html><body>maintenance</body></html>`)

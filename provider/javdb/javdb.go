@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gocolly/colly/v2"
@@ -39,6 +41,7 @@ var (
 	upperNumberPattern  = regexp.MustCompile(`^[A-Z]{1,10}\d{2,}$`)
 	numericPattern      = regexp.MustCompile(`^\d+$`)
 	fc2AttemptPattern   = regexp.MustCompile(`(?i)^FC2(?:[-_\s]?PPV)?[-_\s]?\d`)
+	numberPartsPattern  = regexp.MustCompile(`^([A-Z]+)-([0-9]+)([A-Z]?)$`)
 	errLoginRequired    = errors.New("JavDB login required; configure a JavDB cookie or account")
 	errGeoRestricted    = errors.New("JavDB is unavailable in the current network region")
 	errAntiBotChallenge = errors.New("JavDB returned an anti-bot challenge")
@@ -192,7 +195,7 @@ func (jav *JavDB) ParseMovieIDFromURL(rawURL string) (string, error) {
 		return id, nil
 	case u.Path == "/search":
 		id := jav.NormalizeMovieKeyword(u.Query().Get("q"))
-		if id == "" {
+		if id == "" || !isCatalogKeyword(id) {
 			return "", provider.ErrInvalidURL
 		}
 		return id, nil
@@ -224,18 +227,25 @@ func (jav *JavDB) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
 }
 
 func (jav *JavDB) NormalizeMovieKeyword(keyword string) string {
-	keyword = strings.TrimSpace(number.Trim(keyword))
+	keyword = cleanText(keyword)
 	if keyword == "" {
 		return ""
 	}
 	if fc2ID := fc2util.ParseNumber(keyword); fc2ID != "" {
 		return "FC2-" + fc2ID
 	}
+	if strings.IndexFunc(keyword, unicode.IsSpace) >= 0 {
+		return keyword
+	}
+	keyword = strings.TrimSpace(number.Trim(keyword))
+	if keyword == "" {
+		return ""
+	}
 	keyword = strings.ToUpper(keyword)
 	if numericPattern.MatchString(keyword) {
 		return "FC2-" + keyword
 	}
-	if !idPattern.MatchString(keyword) {
+	if !isCatalogKeyword(keyword) {
 		return ""
 	}
 	return keyword
@@ -327,9 +337,42 @@ func (jav *JavDB) searchMovie(base *url.URL, keyword string) ([]*model.MovieSear
 }
 
 func (jav *JavDB) filterSearchResults(results []*model.MovieSearchResult, keyword string) []*model.MovieSearchResult {
+	if !isCatalogKeyword(keyword) {
+		type scoredResult struct {
+			result *model.MovieSearchResult
+			score  float64
+		}
+
+		scored := make([]scoredResult, 0, len(results))
+		for _, result := range results {
+			if result == nil {
+				continue
+			}
+			score := titleSearchScore(keyword, result.Title)
+			if score < 0.35 {
+				continue
+			}
+			scored = append(scored, scoredResult{result: result, score: score})
+		}
+		sort.SliceStable(scored, func(i, j int) bool {
+			if scored[i].score == scored[j].score {
+				return scored[i].result.ID < scored[j].result.ID
+			}
+			return scored[i].score > scored[j].score
+		})
+		if len(scored) > 8 {
+			scored = scored[:8]
+		}
+		filtered := make([]*model.MovieSearchResult, 0, len(scored))
+		for _, item := range scored {
+			filtered = append(filtered, item.result)
+		}
+		return filtered
+	}
+
 	filtered := make([]*model.MovieSearchResult, 0, len(results))
 	for _, result := range results {
-		if result == nil || !strings.EqualFold(jav.NormalizeMovieKeyword(result.Number), keyword) {
+		if result == nil || !equivalentMovieNumbers(jav.NormalizeMovieKeyword(result.Number), keyword) {
 			continue
 		}
 		filtered = append(filtered, result)
@@ -773,6 +816,112 @@ func isNumberLike(id string) bool {
 	return numericPattern.MatchString(id) ||
 		strings.ContainsAny(id, "-_") ||
 		upperNumberPattern.MatchString(id)
+}
+
+func isCatalogKeyword(keyword string) bool {
+	keyword = strings.ToUpper(strings.TrimSpace(keyword))
+	if keyword == "" || strings.Contains(keyword, " ") {
+		return false
+	}
+	if fc2util.ParseNumber(keyword) != "" || numericPattern.MatchString(keyword) {
+		return true
+	}
+	return isNumberLike(keyword)
+}
+
+func equivalentMovieNumbers(left, right string) bool {
+	left = normalizeNumberKey(left)
+	right = normalizeNumberKey(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if left == right {
+		return true
+	}
+
+	leftHyphen := strings.ReplaceAll(left, "_", "-")
+	rightHyphen := strings.ReplaceAll(right, "_", "-")
+	if leftHyphen == rightHyphen {
+		return true
+	}
+
+	leftParts := numberPartsPattern.FindStringSubmatch(leftHyphen)
+	rightParts := numberPartsPattern.FindStringSubmatch(rightHyphen)
+	if len(leftParts) == 4 && len(rightParts) == 4 {
+		return leftParts[1] == rightParts[1] &&
+			trimLeadingZeros(leftParts[2]) == trimLeadingZeros(rightParts[2]) &&
+			leftParts[3] == rightParts[3]
+	}
+
+	return strings.NewReplacer("-", "", "_", "").Replace(left) ==
+		strings.NewReplacer("-", "", "_", "").Replace(right)
+}
+
+func normalizeNumberKey(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, " ", "-")
+	for strings.Contains(value, "--") {
+		value = strings.ReplaceAll(value, "--", "-")
+	}
+	return strings.Trim(value, "-_")
+}
+
+func trimLeadingZeros(value string) string {
+	trimmed := strings.TrimLeft(value, "0")
+	if trimmed == "" {
+		return "0"
+	}
+	return trimmed
+}
+
+func titleSearchScore(query, title string) float64 {
+	queryKey := normalizeTitleKey(query)
+	titleKey := normalizeTitleKey(title)
+	if queryKey == "" || titleKey == "" {
+		return 0
+	}
+	if queryKey == titleKey {
+		return 1
+	}
+	if len([]rune(queryKey)) >= 6 &&
+		(strings.Contains(titleKey, queryKey) || strings.Contains(queryKey, titleKey)) {
+		return 0.92
+	}
+
+	queryGrams := titleBigrams(queryKey)
+	titleGrams := titleBigrams(titleKey)
+	if len(queryGrams) == 0 || len(titleGrams) == 0 {
+		return 0
+	}
+	common := 0
+	for gram := range queryGrams {
+		if _, ok := titleGrams[gram]; ok {
+			common++
+		}
+	}
+	return 2 * float64(common) / float64(len(queryGrams)+len(titleGrams))
+}
+
+func normalizeTitleKey(value string) string {
+	var builder strings.Builder
+	for _, r := range strings.ToLower(value) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			builder.WriteRune(r)
+		}
+	}
+	return builder.String()
+}
+
+func titleBigrams(value string) map[string]struct{} {
+	runes := []rune(value)
+	if len(runes) < 2 {
+		return map[string]struct{}{}
+	}
+	grams := make(map[string]struct{}, len(runes)-1)
+	for index := 0; index < len(runes)-1; index++ {
+		grams[string(runes[index:index+2])] = struct{}{}
+	}
+	return grams
 }
 
 func isSiteHost(host string) bool {
