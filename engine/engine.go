@@ -203,26 +203,65 @@ func (e *Engine) SetFlareSolverr(endpoint string) ([]string, error) {
 // SetProviderDomains configures fallback domains for a provider.
 // It returns the normalized primary and fallback domains.
 func (e *Engine) SetProviderDomains(name string, backups []string) ([]string, error) {
+	_, domains, err := e.SetProviderDomainConfig(name, nil, &backups)
+	return domains, err
+}
+
+// SetProviderDomainConfig atomically configures a provider's primary and
+// fallback domains when the provider supports combined configuration.
+func (e *Engine) SetProviderDomainConfig(
+	name string,
+	primary *string,
+	backups *[]string,
+) (string, []string, error) {
 	var provider mt.Provider
 	if movieProvider, err := e.GetMovieProviderByName(name); err == nil {
 		provider = movieProvider
 	} else if actorProvider, err := e.GetActorProviderByName(name); err == nil {
 		provider = actorProvider
 	} else {
-		return nil, mt.ErrProviderNotFound
+		return "", nil, mt.ErrProviderNotFound
+	}
+
+	if configurer, ok := provider.(mt.DomainConfigurer); ok {
+		normalizedPrimary, domains, err := configurer.ConfigureDomains(primary, backups)
+		if err != nil {
+			return "", nil, fmt.Errorf("configure %s domains: %w", provider.Name(), err)
+		}
+		if primary != nil {
+			e.logger.Printf("Configured %s primary domain: %s", provider.Name(), normalizedPrimary)
+		}
+		if backups != nil {
+			e.logger.Printf("Configured %s domains: %s", provider.Name(), strings.Join(domains, ", "))
+		}
+		return normalizedPrimary, domains, nil
+	}
+
+	if primary != nil {
+		return "", nil, fmt.Errorf("provider %s does not support a custom primary domain", provider.Name())
 	}
 
 	setter, ok := provider.(mt.DomainSetter)
 	if !ok {
-		return nil, fmt.Errorf("provider %s does not support custom domains", provider.Name())
+		return "", nil, fmt.Errorf("provider %s does not support custom domains", provider.Name())
 	}
-	if err := setter.SetBackupDomains(backups); err != nil {
-		return nil, fmt.Errorf("configure %s domains: %w", provider.Name(), err)
+	if backups == nil {
+		return provider.URL().String(), setter.Domains(), nil
+	}
+	if err := setter.SetBackupDomains(*backups); err != nil {
+		return "", nil, fmt.Errorf("configure %s domains: %w", provider.Name(), err)
 	}
 
 	domains := setter.Domains()
 	e.logger.Printf("Configured %s domains: %s", provider.Name(), strings.Join(domains, ", "))
-	return domains, nil
+	return provider.URL().String(), domains, nil
+}
+
+// SetProviderPrimaryDomain configures a provider's single primary domain.
+// An empty domain restores the provider's built-in primary domain.
+func (e *Engine) SetProviderPrimaryDomain(name, domain string) (string, error) {
+	normalized, _, err := e.SetProviderDomainConfig(name, &domain, nil)
+	return normalized, err
 }
 
 // SetJavDBSession applies a cookie or account session to the JavDB provider.

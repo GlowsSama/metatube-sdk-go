@@ -20,6 +20,16 @@ func New() *Pool {
 }
 
 func (p *Pool) SetBackups(values []string) error {
+	backups, err := NormalizeBackups(values)
+	if err != nil {
+		return err
+	}
+	p.SetBackupURLs(backups)
+	return nil
+}
+
+// NormalizeBackups validates backup domains and removes duplicate hosts.
+func NormalizeBackups(values []string) ([]*url.URL, error) {
 	backups := make([]*url.URL, 0, len(values))
 	seen := make(map[string]struct{})
 
@@ -29,9 +39,9 @@ func (p *Pool) SetBackups(values []string) error {
 			if raw == "" {
 				continue
 			}
-			u, err := normalize(raw)
+			u, err := Normalize(raw)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			key := hostKey(u)
 			if _, exists := seen[key]; exists {
@@ -41,11 +51,20 @@ func (p *Pool) SetBackups(values []string) error {
 			backups = append(backups, u)
 		}
 	}
+	return backups, nil
+}
 
+// SetBackupURLs replaces the configured backup domains without revalidating.
+func (p *Pool) SetBackupURLs(backups []*url.URL) {
+	cloned := make([]*url.URL, 0, len(backups))
+	for _, backup := range backups {
+		if backup != nil {
+			cloned = append(cloned, clone(backup))
+		}
+	}
 	p.mu.Lock()
-	p.backups = backups
+	p.backups = cloned
 	p.mu.Unlock()
-	return nil
 }
 
 func (p *Pool) Candidates(primary *url.URL) []*url.URL {
@@ -96,7 +115,8 @@ func (p *Pool) Matches(primary, candidate *url.URL) bool {
 	return false
 }
 
-func normalize(raw string) (*url.URL, error) {
+// Normalize validates a domain and returns a normalized HTTP(S) base URL.
+func Normalize(raw string) (*url.URL, error) {
 	if !strings.Contains(raw, "://") {
 		raw = "https://" + raw
 	}

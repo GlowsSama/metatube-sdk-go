@@ -122,6 +122,18 @@ type DomainSetter interface {
 	Domains() []string
 }
 
+type PrimaryDomainSetter interface {
+	// SetPrimaryDomain configures the primary domain. An empty value restores
+	// the provider's built-in primary domain.
+	SetPrimaryDomain(domain string) error
+}
+
+type DomainConfigurer interface {
+	// ConfigureDomains atomically validates and applies a primary domain and/or
+	// backup domains. Nil fields leave the corresponding setting unchanged.
+	ConfigureDomains(primary *string, backups *[]string) (string, []string, error)
+}
+
 type URLMatcher interface {
 	// MatchesURL reports whether the URL belongs to this provider, including
 	// any runtime-configured fallback domains.

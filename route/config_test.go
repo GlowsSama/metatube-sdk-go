@@ -31,7 +31,8 @@ type flareSolverrResponse struct {
 
 type domainsResponse struct {
 	Data struct {
-		Providers map[string][]string `json:"providers"`
+		Providers      map[string][]string `json:"providers"`
+		PrimaryDomains map[string]string   `json:"primary_domains"`
 	} `json:"data"`
 	Error struct {
 		Code    int    `json:"code"`
@@ -140,6 +141,27 @@ func TestDomainsConfig(t *testing.T) {
 			response.Data.Providers["MissAV"])
 	})
 
+	t.Run("configures and normalizes a primary domain", func(t *testing.T) {
+		rec, response := send(
+			`{"primary_domains":{"JavDB":"https://main.example/path"}}`,
+			testToken,
+		)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Equal(t, "https://main.example/", response.Data.PrimaryDomains["JavDB"])
+		assert.NotContains(t, response.Data.Providers, "JavDB")
+	})
+
+	t.Run("configures primary and backup domains together", func(t *testing.T) {
+		rec, response := send(
+			`{"providers":{"JavDB":["https://backup.example/path"]},"primary_domains":{"JavDB":"https://main.example/path"}}`,
+			testToken,
+		)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Equal(t, "https://main.example/", response.Data.PrimaryDomains["JavDB"])
+		assert.Equal(t, []string{"https://main.example/", "https://backup.example/"},
+			response.Data.Providers["JavDB"])
+	})
+
 	t.Run("accepts more than five total domains", func(t *testing.T) {
 		rec, response := send(
 			`{"providers":{"JavDB":["one.example","two.example","three.example","four.example","five.example","six.example"]}}`,
@@ -153,6 +175,12 @@ func TestDomainsConfig(t *testing.T) {
 		rec, response := send(`{"providers":{"FC2":["backup.example"]}}`, testToken)
 		assert.Equal(t, http.StatusBadRequest, rec.Code)
 		assert.Contains(t, response.Error.Message, "does not support custom domains")
+	})
+
+	t.Run("rejects unsupported primary domain providers", func(t *testing.T) {
+		rec, response := send(`{"primary_domains":{"FC2":"backup.example"}}`, testToken)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, response.Error.Message, "does not support a custom primary domain")
 	})
 }
 

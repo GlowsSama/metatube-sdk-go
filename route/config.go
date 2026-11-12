@@ -14,7 +14,8 @@ type flareSolverrConfig struct {
 }
 
 type domainsConfig struct {
-	Providers map[string][]string `json:"providers" binding:"required"`
+	Providers      map[string][]string `json:"providers,omitempty"`
+	PrimaryDomains map[string]string   `json:"primary_domains,omitempty"`
 }
 
 type javDBSessionConfig struct {
@@ -54,24 +55,51 @@ func setDomains(app *engine.Engine) gin.HandlerFunc {
 			return
 		}
 
-		names := make([]string, 0, len(config.Providers))
+		nameSet := make(map[string]struct{}, len(config.Providers)+len(config.PrimaryDomains))
 		for name := range config.Providers {
+			nameSet[name] = struct{}{}
+		}
+		for name := range config.PrimaryDomains {
+			nameSet[name] = struct{}{}
+		}
+		names := make([]string, 0, len(nameSet))
+		for name := range nameSet {
 			names = append(names, name)
 		}
 		sort.Strings(names)
 
+		normalizedPrimary := make(map[string]string, len(config.PrimaryDomains))
 		normalized := make(map[string][]string, len(config.Providers))
 		for _, name := range names {
-			domains, err := app.SetProviderDomains(name, config.Providers[name])
+			var (
+				primaryInput *string
+				backupsInput *[]string
+			)
+			if primary, ok := config.PrimaryDomains[name]; ok {
+				primaryInput = &primary
+			}
+			if backups, ok := config.Providers[name]; ok {
+				backupsInput = &backups
+			}
+
+			primary, domains, err := app.SetProviderDomainConfig(name, primaryInput, backupsInput)
 			if err != nil {
 				abortWithStatusMessage(c, http.StatusBadRequest, err)
 				return
 			}
-			normalized[name] = domains
+			if primaryInput != nil {
+				normalizedPrimary[name] = primary
+			}
+			if backupsInput != nil {
+				normalized[name] = domains
+			}
 		}
 
 		c.JSON(http.StatusOK, &responseMessage{
-			Data: gin.H{"providers": normalized},
+			Data: gin.H{
+				"providers":       normalized,
+				"primary_domains": normalizedPrimary,
+			},
 		})
 	}
 }

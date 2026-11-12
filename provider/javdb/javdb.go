@@ -29,12 +29,14 @@ import (
 )
 
 var (
-	_ provider.MovieProvider     = (*JavDB)(nil)
-	_ provider.MovieSearcher     = (*JavDB)(nil)
-	_ provider.Fetcher           = (*JavDB)(nil)
-	_ provider.DomainSetter      = (*JavDB)(nil)
-	_ provider.URLMatcher        = (*JavDB)(nil)
-	_ provider.SessionConfigurer = (*JavDB)(nil)
+	_ provider.MovieProvider       = (*JavDB)(nil)
+	_ provider.MovieSearcher       = (*JavDB)(nil)
+	_ provider.Fetcher             = (*JavDB)(nil)
+	_ provider.DomainSetter        = (*JavDB)(nil)
+	_ provider.PrimaryDomainSetter = (*JavDB)(nil)
+	_ provider.DomainConfigurer    = (*JavDB)(nil)
+	_ provider.URLMatcher          = (*JavDB)(nil)
+	_ provider.SessionConfigurer   = (*JavDB)(nil)
 
 	scorePattern        = regexp.MustCompile(`\d+(?:\.\d+)?`)
 	idPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
@@ -68,7 +70,10 @@ type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
 	domains             *domainpool.Pool
+	domainMu            sync.RWMutex
+	primaryDomain       *url.URL
 	sessionMu           sync.Mutex
+	sessionDomains      map[string]struct{}
 	domainPolicyMu      sync.Mutex
 	domainFailureRounds int
 	domainCooldownUntil time.Time
@@ -83,24 +88,119 @@ func New() *JavDB {
 				"Referer":         baseURL,
 				"Accept-Language": "zh-CN,zh;q=0.9",
 			})),
-		domains: domainpool.New(),
-		now:     time.Now,
+		domains:        domainpool.New(),
+		sessionDomains: make(map[string]struct{}),
+		now:            time.Now,
 	}
 }
 
+func (jav *JavDB) URL() *url.URL {
+	jav.domainMu.RLock()
+	primary := jav.primaryDomain
+	jav.domainMu.RUnlock()
+	if primary != nil {
+		cloned := *primary
+		return &cloned
+	}
+	if jav.Scraper != nil && jav.Scraper.URL() != nil {
+		cloned := *jav.Scraper.URL()
+		return &cloned
+	}
+	fallback, _ := url.Parse(baseURL)
+	return fallback
+}
+
+func (jav *JavDB) SetPrimaryDomain(domain string) error {
+	_, _, err := jav.ConfigureDomains(&domain, nil)
+	return err
+}
+
 func (jav *JavDB) SetBackupDomains(domains []string) error {
-	if err := jav.domains.SetBackups(domains); err != nil {
-		return err
+	_, _, err := jav.ConfigureDomains(nil, &domains)
+	return err
+}
+
+func (jav *JavDB) ConfigureDomains(primary *string, backups *[]string) (string, []string, error) {
+	var normalizedPrimary *url.URL
+	if primary != nil {
+		domain := strings.TrimSpace(*primary)
+		if domain != "" {
+			var err error
+			normalizedPrimary, err = domainpool.Normalize(domain)
+			if err != nil {
+				return "", nil, err
+			}
+		}
+	}
+
+	var normalizedBackups []*url.URL
+	if backups != nil {
+		var err error
+		normalizedBackups, err = domainpool.NormalizeBackups(*backups)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+
+	if primary != nil {
+		current := jav.URL().String()
+		target := current
+		if normalizedPrimary != nil {
+			target = normalizedPrimary.String()
+		} else if jav.Scraper != nil && jav.Scraper.URL() != nil {
+			target = jav.Scraper.URL().String()
+		}
+
+		jav.sessionMu.Lock()
+		if target != current {
+			if err := jav.clearSessionCookies(); err != nil {
+				jav.sessionMu.Unlock()
+				return "", nil, err
+			}
+		}
+		jav.domainMu.Lock()
+		jav.primaryDomain = normalizedPrimary
+		jav.domainMu.Unlock()
+		jav.sessionMu.Unlock()
+	}
+
+	if backups != nil {
+		jav.domains.SetBackupURLs(normalizedBackups)
 	}
 
 	jav.domainPolicyMu.Lock()
 	jav.clearDomainFailuresLocked()
 	jav.domainPolicyMu.Unlock()
-	return nil
+
+	return jav.URL().String(), jav.Domains(), nil
 }
 
 func (jav *JavDB) Domains() []string {
 	return jav.domains.Domains(jav.URL())
+}
+
+func runDomainAttempts[T any](
+	operation func(*url.URL) (T, error),
+	base *url.URL,
+) (T, error, bool) {
+	var lastErr error
+	for attempt := 0; attempt < maxDomainAttempts; attempt++ {
+		value, err := operation(base)
+		if err == nil {
+			return value, nil, false
+		}
+		if errors.Is(err, errLoginRequired) {
+			var zero T
+			return zero, err, true
+		}
+		if stopDomainFallback(err) {
+			var zero T
+			return zero, err, false
+		}
+		lastErr = err
+	}
+	var zero T
+	return zero, lastErr, false
 }
 
 // ConfigureSession applies a JavDB browser cookie or attempts a password
@@ -150,7 +250,11 @@ func (jav *JavDB) ConfigureSession(username, password, cookie string) (provider.
 			Message:    "JavDB 账号和密码需要同时填写",
 		}, nil
 	}
-	return jav.loginWithPassword(username, password)
+	status, err := jav.loginWithPassword(username, password)
+	if err == nil && status.Authenticated {
+		jav.rememberSessionDomainLocked(jav.URL().String())
+	}
+	return status, err
 }
 
 func (jav *JavDB) MatchesURL(u *url.URL) bool {
@@ -285,19 +389,50 @@ func executeWithDomainPolicy[T any](
 	}
 
 	var lastErr error
-	for _, base := range jav.domains.Candidates(jav.URL()) {
-		for attempt := 0; attempt < maxDomainAttempts; attempt++ {
-			value, err := operation(base)
+	candidates := jav.domains.Candidates(jav.URL())
+	if len(candidates) <= 1 {
+		value, err, loginRequired := runDomainAttempts(operation, jav.URL())
+		if err == nil {
+			jav.clearDomainFailuresLocked()
+			return value, nil
+		}
+		if loginRequired || stopDomainFallback(err) {
+			jav.clearDomainFailuresLocked()
+			return value, err
+		}
+		lastErr = err
+	} else {
+		primary := candidates[0]
+		loginRequired := false
+		for _, base := range candidates[1:] {
+			value, err, requiresLogin := runDomainAttempts(operation, base)
 			if err == nil {
 				jav.clearDomainFailuresLocked()
 				return value, nil
 			}
 			if stopDomainFallback(err) {
 				jav.clearDomainFailuresLocked()
-				var zero T
-				return zero, err
+				return value, err
 			}
+			lastErr = err
+			if requiresLogin {
+				loginRequired = true
+				break
+			}
+		}
 
+		// The authenticated main site is only a fallback when an anonymous
+		// backup explicitly requires a login. Ordinary failures never reach it.
+		if loginRequired {
+			value, err, requiresLogin := runDomainAttempts(operation, primary)
+			if err == nil {
+				jav.clearDomainFailuresLocked()
+				return value, nil
+			}
+			if requiresLogin || stopDomainFallback(err) {
+				jav.clearDomainFailuresLocked()
+				return value, err
+			}
 			lastErr = err
 		}
 	}
@@ -457,33 +592,59 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 }
 
 func (jav *JavDB) clearSessionCookies() error {
-	for _, domain := range jav.Domains() {
+	domainSet := make(map[string]struct{}, len(jav.sessionDomains)+1)
+	for domain := range jav.sessionDomains {
+		domainSet[domain] = struct{}{}
+	}
+	for _, candidate := range jav.domains.Candidates(jav.URL()) {
+		domainSet[candidate.String()] = struct{}{}
+	}
+	domainSet[jav.URL().String()] = struct{}{}
+
+	domains := make([]string, 0, len(domainSet))
+	for domain := range domainSet {
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+
+	for _, domain := range domains {
 		if err := jav.ResetCookies(domain); err != nil {
 			return fmt.Errorf("%s: clear cookies for %s: %w", jav.Name(), domain, err)
 		}
 	}
+	jav.sessionDomains = make(map[string]struct{})
 	return nil
 }
 
 func (jav *JavDB) applySessionCookies(cookies []*http.Cookie) error {
-	for _, domain := range jav.Domains() {
-		hostCookies := make([]*http.Cookie, 0, len(cookies))
-		for _, cookie := range cookies {
-			if cookie == nil || cookie.Name == "" {
-				continue
-			}
-			item := *cookie
-			item.Domain = ""
-			if item.Path == "" {
-				item.Path = "/"
-			}
-			hostCookies = append(hostCookies, &item)
+	hostCookies := make([]*http.Cookie, 0, len(cookies))
+	for _, cookie := range cookies {
+		if cookie == nil || cookie.Name == "" {
+			continue
 		}
-		if err := jav.SetCookies(domain, hostCookies); err != nil {
-			return fmt.Errorf("%s: set cookies for %s: %w", jav.Name(), domain, err)
+		item := *cookie
+		item.Domain = ""
+		if item.Path == "" {
+			item.Path = "/"
 		}
+		hostCookies = append(hostCookies, &item)
 	}
+	domain := jav.URL().String()
+	if err := jav.SetCookies(domain, hostCookies); err != nil {
+		return fmt.Errorf("%s: set cookies for %s: %w", jav.Name(), domain, err)
+	}
+	jav.rememberSessionDomainLocked(domain)
 	return nil
+}
+
+func (jav *JavDB) rememberSessionDomainLocked(domain string) {
+	if domain == "" {
+		return
+	}
+	if jav.sessionDomains == nil {
+		jav.sessionDomains = make(map[string]struct{})
+	}
+	jav.sessionDomains[domain] = struct{}{}
 }
 
 func (jav *JavDB) loginWithPassword(username, password string) (provider.SessionStatus, error) {
@@ -989,6 +1150,9 @@ func detectPageError(body []byte) error {
 }
 
 func isLoginDocument(doc *goquery.Document) bool {
+	if doc.Find(`input[type="password"], input[name="password"]`).Length() == 0 {
+		return false
+	}
 	title := strings.ToLower(cleanText(doc.Find("title").First().Text()))
 	return doc.Find(`form[action*="/auth/signin"], form[action*="/auth/login"], form[action*="/login"], form[action*="sign_in"]`).Length() > 0 ||
 		strings.Contains(title, "登入") ||
