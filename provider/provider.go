@@ -114,6 +114,12 @@ type SessionConfigurer interface {
 	ConfigureSession(username, password, cookie, authorization string) (SessionStatus, error)
 }
 
+type SessionAPIConfigurer interface {
+	// ConfigureSessionWithAPI applies an authenticated browsing session and a
+	// separate mobile API endpoint.
+	ConfigureSessionWithAPI(username, password, cookie, authorization, apiURL string) (SessionStatus, error)
+}
+
 type DomainSetter interface {
 	// SetBackupDomains configures fallback domains in priority order.
 	SetBackupDomains(domains []string) error

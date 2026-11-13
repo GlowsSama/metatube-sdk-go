@@ -23,6 +23,7 @@ type javDBSessionConfig struct {
 	Password      string `json:"password"`
 	Cookie        string `json:"cookie"`
 	Authorization string `json:"authorization"`
+	APIURL        string `json:"api_url"`
 }
 
 func setFlareSolverr(app *engine.Engine) gin.HandlerFunc {
@@ -113,8 +114,8 @@ func setJavDBSession(app *engine.Engine) gin.HandlerFunc {
 			return
 		}
 
-		status, err := app.SetJavDBSession(config.Username, config.Password, config.Cookie,
-			config.Authorization)
+		status, err := app.SetJavDBSessionWithAPI(config.Username, config.Password, config.Cookie,
+			config.Authorization, config.APIURL)
 		if err != nil {
 			abortWithStatusMessage(c, http.StatusBadRequest, err)
 			return

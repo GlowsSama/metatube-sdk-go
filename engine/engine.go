@@ -264,20 +264,40 @@ func (e *Engine) SetProviderPrimaryDomain(name, domain string) (string, error) {
 	return normalized, err
 }
 
-// SetJavDBSession applies an authorization, cookie, or account session to the
-// JavDB provider.
+// SetJavDBSession applies an App API token or website fallback credentials to
+// the JavDB provider using its built-in App API endpoint.
 // Credentials are never written to the engine log.
 func (e *Engine) SetJavDBSession(username, password, cookie, authorization string) (mt.SessionStatus, error) {
+	return e.SetJavDBSessionWithAPI(username, password, cookie, authorization, "")
+}
+
+// SetJavDBSessionWithAPI applies an App API token or website fallback
+// credentials to the JavDB provider. An empty apiURL uses the built-in
+// endpoint. Credentials are never written to the engine log.
+func (e *Engine) SetJavDBSessionWithAPI(
+	username, password, cookie, authorization, apiURL string,
+) (mt.SessionStatus, error) {
 	provider, err := e.GetMovieProviderByName("JavDB")
 	if err != nil {
 		return mt.SessionStatus{}, err
 	}
-	configurer, ok := provider.(mt.SessionConfigurer)
+
+	var (
+		status mt.SessionStatus
+		ok     bool
+	)
+	if configurer, supported := provider.(mt.SessionAPIConfigurer); supported {
+		status, err = configurer.ConfigureSessionWithAPI(
+			username, password, cookie, authorization, apiURL)
+		ok = true
+	} else if configurer, supported := provider.(mt.SessionConfigurer); supported {
+		status, err = configurer.ConfigureSession(username, password, cookie, authorization)
+		ok = true
+	}
 	if !ok {
 		return mt.SessionStatus{}, fmt.Errorf("provider %s does not support sessions", provider.Name())
 	}
 
-	status, err := configurer.ConfigureSession(username, password, cookie, authorization)
 	if err != nil {
 		return mt.SessionStatus{}, fmt.Errorf("configure %s session: %w", provider.Name(), err)
 	}

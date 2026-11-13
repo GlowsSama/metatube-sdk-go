@@ -137,7 +137,7 @@ func TestJavDB_EquivalentMovieNumbers(t *testing.T) {
 	}{
 		{name: "HEYZO leading zero", left: "HEYZO-0258", right: "HEYZO-258", expected: true},
 		{name: "SERO leading zero", left: "SERO-0170", right: "SERO-170", expected: true},
-		{name: "date separator", left: "052612_348", right: "052612-348", expected: true},
+		{name: "date separator", left: "052612_348", right: "052612-348", expected: false},
 		{name: "trailing suffix", left: "MXNB-001S", right: "MXNB-001S", expected: true},
 		{name: "compound number", left: "HEYDOUGA-4030-2133", right: "HEYDOUGA-4030-2133", expected: true},
 		{name: "alphanumeric number", left: "MKBD-S94", right: "MKBD-S94", expected: true},
@@ -480,16 +480,16 @@ func TestNormalizeAuthorization(t *testing.T) {
 		want  string
 	}{
 		{name: "empty"},
-		{name: "raw token", input: "raw-token", want: "Bearer raw-token"},
-		{name: "bearer token", input: "Bearer raw-token", want: "Bearer raw-token"},
-		{name: "lowercase bearer", input: "bearer raw-token", want: "Bearer raw-token"},
+		{name: "raw token", input: "raw-token", want: "raw-token"},
+		{name: "bearer token", input: "Bearer raw-token", want: "raw-token"},
+		{name: "lowercase bearer", input: "bearer raw-token", want: "raw-token"},
 		{
 			name: "authorization header", input: "Authorization: Bearer raw-token",
-			want: "Bearer raw-token",
+			want: "raw-token",
 		},
 		{
 			name: "authorization header without scheme", input: "authorization: raw-token",
-			want: "Bearer raw-token",
+			want: "raw-token",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -503,76 +503,77 @@ func TestNormalizeAuthorization(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestJavDB_AuthorizationPriorityAndClear(t *testing.T) {
-	var authorizations, cookies []string
+func TestJavDB_AuthorizationIsStoredAsAppAPIOnly(t *testing.T) {
+	var websiteAuthorizations []string
 	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/search", r.URL.Path)
-		authorizations = append(authorizations, r.Header.Get("Authorization"))
-		cookies = append(cookies, r.Header.Get("Cookie"))
+		websiteAuthorizations = append(websiteAuthorizations, r.Header.Get("Authorization"))
 		fmt.Fprint(w, `<div class="movie-list">`+
 			card("authorization", "SONE-065", "Authorization session", "/cover.jpg")+`</div>`)
 	})
 
-	status, err := jav.ConfigureSession(
-		"user@example.com",
-		"secret-password",
-		"session=ignored",
-		"Authorization: Bearer raw-token",
-	)
+	status, err := jav.ConfigureSessionWithAPI(
+		"", "", "", "Authorization: Bearer raw-token", "https://api.example.test/api")
 	require.NoError(t, err)
 	assert.True(t, status.Configured)
 	assert.True(t, status.Authenticated)
-	assert.Equal(t, "authorization", status.Mode)
+	assert.Equal(t, "app_api", status.Mode)
 	assert.NotContains(t, status.Message, "raw-token")
+	assert.NotNil(t, jav.appAPIClient())
 
 	_, err = jav.SearchMovie("SONE-065")
 	require.NoError(t, err)
-	require.Len(t, authorizations, 1)
-	assert.Equal(t, "Bearer raw-token", authorizations[0])
-	assert.Empty(t, cookies[0])
+	require.Len(t, websiteAuthorizations, 1)
+	assert.Empty(t, websiteAuthorizations[0])
 
 	status, err = jav.ConfigureSession("", "", "", "")
 	require.NoError(t, err)
 	assert.False(t, status.Configured)
-
-	_, err = jav.SearchMovie("SONE-065")
-	require.NoError(t, err)
-	require.Len(t, authorizations, 2)
-	assert.Empty(t, authorizations[1])
-	assert.Empty(t, cookies[1])
+	assert.Nil(t, jav.appAPIClient())
 }
 
-func TestJavDB_AuthorizationOnlySentToPrimaryFallback(t *testing.T) {
-	var primaryAuthorizations, backupAuthorizations []string
+func TestJavDB_AppAPIWinsBeforePrimaryWebsiteFallback(t *testing.T) {
+	var primaryHits, backupAuthorizations int
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		primaryAuthorizations = append(primaryAuthorizations, r.Header.Get("Authorization"))
+		primaryHits++
 		fmt.Fprint(w, detailPage("SONE-065", "Primary authorization title", "/primary-cover.jpg"))
 	}))
 	t.Cleanup(primary.Close)
 
 	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		backupAuthorizations = append(backupAuthorizations, r.Header.Get("Authorization"))
+		if r.Header.Get("Authorization") != "" {
+			backupAuthorizations++
+		}
 		fmt.Fprint(w, `<html><head><title>登入 - JavDB</title></head><body><form action="/login"><input type="password" name="password"></form></body></html>`)
 	}))
 	t.Cleanup(backup.Close)
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v4/movies/wKg2O2", r.URL.Path)
+		assert.Equal(t, "Bearer primary-token", r.Header.Get("Authorization"))
+		assert.NotEmpty(t, r.Header.Get("jdsignature"))
+		fmt.Fprint(w, `{"success":1,"data":{"movie":{
+			"id":"wKg2O2","number":"SONE-065","title":"App API title",
+			"origin_title":"App API title","cover_url":"https://img.example/cover.jpg",
+			"release_date":"2026-08-01"
+		}}}`)
+	}))
+	t.Cleanup(apiServer.Close)
 
 	jav := New()
 	primaryURL := strings.Replace(primary.URL, "127.0.0.1", "localhost", 1)
 	jav.Scraper = scraper.NewDefaultScraper(Name, primaryURL, Priority, language.Chinese)
 	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
-	_, err := jav.ConfigureSession("", "", "", "primary-token")
+	_, err := jav.ConfigureSessionWithAPI("", "", "", "primary-token", apiServer.URL+"/api")
 	require.NoError(t, err)
 
 	info, err := jav.GetMovieInfoByID("wKg2O2")
 	require.NoError(t, err)
-	assert.Equal(t, "Primary authorization title", info.Title)
-	require.Len(t, backupAuthorizations, 1)
-	assert.Empty(t, backupAuthorizations[0])
-	require.Len(t, primaryAuthorizations, 1)
-	assert.Equal(t, "Bearer primary-token", primaryAuthorizations[0])
+	assert.Equal(t, "App API title", info.Title)
+	assert.Zero(t, backupAuthorizations)
+	assert.Zero(t, primaryHits)
 }
 
-func TestJavDB_AuthorizationNotForwardedAcrossRedirect(t *testing.T) {
+func TestJavDB_AppAPIFailureFallsBackToWebsiteWithoutToken(t *testing.T) {
 	var backupHits int
 	var primaryAuthorizations, backupAuthorizations []string
 	var backupURL string
@@ -591,22 +592,29 @@ func TestJavDB_AuthorizationNotForwardedAcrossRedirect(t *testing.T) {
 
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		primaryAuthorizations = append(primaryAuthorizations, r.Header.Get("Authorization"))
+		assert.Contains(t, r.Header.Get("Cookie"), "session=website-cookie")
 		http.Redirect(w, r, backupURL+"/v/redirected", http.StatusFound)
 	}))
 	t.Cleanup(primary.Close)
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporary upstream failure primary-token", http.StatusInternalServerError)
+	}))
+	t.Cleanup(apiServer.Close)
 
 	jav := New()
 	primaryURL := strings.Replace(primary.URL, "127.0.0.1", "localhost", 1)
 	jav.Scraper = scraper.NewDefaultScraper(Name, primaryURL, Priority, language.Chinese)
 	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
-	_, err := jav.ConfigureSession("", "", "", "primary-token")
+	_, err := jav.ConfigureSessionWithAPI("", "", "session=website-cookie", "primary-token",
+		apiServer.URL+"/api")
 	require.NoError(t, err)
 
 	info, err := jav.GetMovieInfoByID("wKg2O2")
 	require.NoError(t, err)
 	assert.Equal(t, "Redirected title", info.Title)
 	require.Len(t, primaryAuthorizations, 1)
-	assert.Equal(t, "Bearer primary-token", primaryAuthorizations[0])
+	assert.Empty(t, primaryAuthorizations[0])
 	require.Len(t, backupAuthorizations, 2)
 	assert.Empty(t, backupAuthorizations[0])
 	assert.Empty(t, backupAuthorizations[1])
@@ -672,16 +680,16 @@ func TestJavDB_SetPrimaryDomainClearsPreviousSessionCookies(t *testing.T) {
 	assert.Empty(t, oldPrimaryCookies[0])
 }
 
-func TestJavDB_SetPrimaryDomainClearsPreviousAuthorization(t *testing.T) {
-	var oldPrimaryAuthorizations, newPrimaryAuthorizations []string
+func TestJavDB_SetPrimaryDomainClearsPreviousAppAPIToken(t *testing.T) {
+	var oldPrimaryAuthorizations []string
 	oldPrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		oldPrimaryAuthorizations = append(oldPrimaryAuthorizations, r.Header.Get("Authorization"))
-		fmt.Fprint(w, `<html><head><title>登入 - JavDB</title></head><body><form action="/login"><input type="password" name="password"></form></body></html>`)
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("old", "SONE-065", "Old primary title", "/old-cover.jpg")+`</div>`)
 	}))
 	t.Cleanup(oldPrimary.Close)
 
-	newPrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		newPrimaryAuthorizations = append(newPrimaryAuthorizations, r.Header.Get("Authorization"))
+	newPrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, detailPage("SONE-065", "New primary title", "/new-primary-cover.jpg"))
 	}))
 	t.Cleanup(newPrimary.Close)
@@ -691,17 +699,18 @@ func TestJavDB_SetPrimaryDomainClearsPreviousAuthorization(t *testing.T) {
 	jav.Scraper = scraper.NewDefaultScraper(Name, oldPrimaryURL, Priority, language.Chinese)
 	_, err := jav.ConfigureSession("", "", "", "old-primary-token")
 	require.NoError(t, err)
+	assert.NotNil(t, jav.appAPIClient())
 
 	require.NoError(t, jav.SetPrimaryDomain(newPrimary.URL))
+	assert.Nil(t, jav.appAPIClient())
 	require.NoError(t, jav.SetBackupDomains([]string{oldPrimary.URL}))
 
-	info, err := jav.GetMovieInfoByID("wKg2O2")
+	results, err := jav.SearchMovie("SONE-065")
 	require.NoError(t, err)
-	assert.Equal(t, "New primary title", info.Title)
+	require.Len(t, results, 1)
+	assert.Equal(t, "Old primary title", results[0].Title)
 	require.Len(t, oldPrimaryAuthorizations, 1)
 	assert.Empty(t, oldPrimaryAuthorizations[0])
-	require.Len(t, newPrimaryAuthorizations, 1)
-	assert.Empty(t, newPrimaryAuthorizations[0])
 }
 
 func TestJavDB_ConfigureSessionWithPassword(t *testing.T) {

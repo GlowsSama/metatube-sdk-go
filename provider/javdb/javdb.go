@@ -2,6 +2,7 @@ package javdb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -29,14 +30,15 @@ import (
 )
 
 var (
-	_ provider.MovieProvider       = (*JavDB)(nil)
-	_ provider.MovieSearcher       = (*JavDB)(nil)
-	_ provider.Fetcher             = (*JavDB)(nil)
-	_ provider.DomainSetter        = (*JavDB)(nil)
-	_ provider.PrimaryDomainSetter = (*JavDB)(nil)
-	_ provider.DomainConfigurer    = (*JavDB)(nil)
-	_ provider.URLMatcher          = (*JavDB)(nil)
-	_ provider.SessionConfigurer   = (*JavDB)(nil)
+	_ provider.MovieProvider        = (*JavDB)(nil)
+	_ provider.MovieSearcher        = (*JavDB)(nil)
+	_ provider.Fetcher              = (*JavDB)(nil)
+	_ provider.DomainSetter         = (*JavDB)(nil)
+	_ provider.PrimaryDomainSetter  = (*JavDB)(nil)
+	_ provider.DomainConfigurer     = (*JavDB)(nil)
+	_ provider.URLMatcher           = (*JavDB)(nil)
+	_ provider.SessionConfigurer    = (*JavDB)(nil)
+	_ provider.SessionAPIConfigurer = (*JavDB)(nil)
 
 	scorePattern        = regexp.MustCompile(`\d+(?:\.\d+)?`)
 	idPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
@@ -44,7 +46,7 @@ var (
 	numericPattern      = regexp.MustCompile(`^\d+$`)
 	fc2AttemptPattern   = regexp.MustCompile(`(?i)^FC2(?:[-_\s]?PPV)?[-_\s]?\d`)
 	numberPartsPattern  = regexp.MustCompile(`^([A-Z]+)-([0-9]+)([A-Z]?)$`)
-	errLoginRequired    = errors.New("JavDB login required; configure a JavDB cookie or account")
+	errLoginRequired    = errors.New("JavDB login required; configure a JavDB App API token, cookie, or account")
 	errGeoRestricted    = errors.New("JavDB is unavailable in the current network region")
 	errAntiBotChallenge = errors.New("JavDB returned an anti-bot challenge")
 	errDomainCooldown   = errors.New("JavDB request cooldown is active")
@@ -69,17 +71,17 @@ const (
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
-	domains              *domainpool.Pool
-	domainMu             sync.RWMutex
-	primaryDomain        *url.URL
-	sessionConfigMu      sync.Mutex
-	sessionMu            sync.Mutex
-	sessionDomains       map[string]struct{}
-	sessionAuthorization string
-	domainPolicyMu       sync.Mutex
-	domainFailureRounds  int
-	domainCooldownUntil  time.Time
-	now                  func() time.Time
+	domains             *domainpool.Pool
+	domainMu            sync.RWMutex
+	primaryDomain       *url.URL
+	sessionConfigMu     sync.Mutex
+	sessionMu           sync.Mutex
+	sessionDomains      map[string]struct{}
+	sessionAppAPI       *javDBAppAPI
+	domainPolicyMu      sync.Mutex
+	domainFailureRounds int
+	domainCooldownUntil time.Time
+	now                 func() time.Time
 }
 
 func New() *JavDB {
@@ -208,15 +210,28 @@ func runDomainAttempts[T any](
 	return zero, lastErr, false
 }
 
-// ConfigureSession applies one JavDB login method. Authorization has priority
-// over cookie, and cookie has priority over account credentials. JavDB may
-// require an image captcha, which this client cannot solve.
+// ConfigureSession applies an App API token and optional website fallback
+// credentials. Authorization is only used by the separate mobile API client.
+// JavDB may require an image captcha for website account login.
 func (jav *JavDB) ConfigureSession(
 	username, password, cookie, authorization string,
 ) (provider.SessionStatus, error) {
+	return jav.ConfigureSessionWithAPI(username, password, cookie, authorization,
+		defaultAppAPIBaseURL)
+}
+
+// ConfigureSessionWithAPI applies a JavDB App API token and optional website
+// fallback credentials. The token is never attached to website requests.
+func (jav *JavDB) ConfigureSessionWithAPI(
+	username, password, cookie, authorization, apiURL string,
+) (provider.SessionStatus, error) {
 	username = strings.TrimSpace(username)
 	cookie = strings.TrimSpace(cookie)
-	authorization, err := normalizeAuthorization(authorization)
+	token, err := normalizeAuthorization(authorization)
+	if err != nil {
+		return provider.SessionStatus{}, err
+	}
+	appAPI, err := newJavDBAppAPI(token, apiURL, nil)
 	if err != nil {
 		return provider.SessionStatus{}, err
 	}
@@ -226,7 +241,7 @@ func (jav *JavDB) ConfigureSession(
 
 	jav.sessionMu.Lock()
 
-	if username == "" && password == "" && cookie == "" && authorization == "" {
+	if username == "" && password == "" && cookie == "" && token == "" {
 		if err := jav.clearSessionStateLocked(); err != nil {
 			jav.sessionMu.Unlock()
 			return provider.SessionStatus{}, err
@@ -244,16 +259,7 @@ func (jav *JavDB) ConfigureSession(
 		return provider.SessionStatus{}, err
 	}
 
-	if authorization != "" {
-		jav.sessionAuthorization = authorization
-		jav.sessionMu.Unlock()
-		return provider.SessionStatus{
-			Configured:    true,
-			Authenticated: true,
-			Mode:          "authorization",
-			Message:       "JavDB Authorization 已应用；仅在主站登录兜底时使用",
-		}, nil
-	}
+	jav.sessionAppAPI = appAPI
 
 	if cookie != "" {
 		cookies, err := parseCookieHeader(cookie)
@@ -266,11 +272,27 @@ func (jav *JavDB) ConfigureSession(
 			return provider.SessionStatus{}, err
 		}
 		jav.sessionMu.Unlock()
+		mode := "cookie"
+		message := "JavDB Cookie 已应用；如果已过期，请重新从浏览器获取"
+		if appAPI != nil {
+			mode = "app_api+cookie"
+			message = "JavDB App API Token 和网页 Cookie 已应用；App API 优先兜底"
+		}
 		return provider.SessionStatus{
 			Configured:    true,
 			Authenticated: true,
-			Mode:          "cookie",
-			Message:       "JavDB Cookie 已应用；如果已过期，请重新从浏览器获取",
+			Mode:          mode,
+			Message:       message,
+		}, nil
+	}
+
+	if appAPI != nil && (username == "" || password == "") {
+		jav.sessionMu.Unlock()
+		return provider.SessionStatus{
+			Configured:    true,
+			Authenticated: true,
+			Mode:          "app_api",
+			Message:       "JavDB App API Token 已应用；仅用于备用站要求登录后的兜底",
 		}, nil
 	}
 
@@ -288,6 +310,10 @@ func (jav *JavDB) ConfigureSession(
 	if err == nil && status.Authenticated {
 		jav.sessionMu.Lock()
 		jav.rememberSessionDomainLocked(jav.URL().String())
+		if appAPI != nil {
+			status.Mode = "app_api+password"
+			status.Message = "JavDB App API Token 和账号密码已应用；App API 优先兜底"
+		}
 		jav.sessionMu.Unlock()
 	}
 	return status, err
@@ -363,6 +389,15 @@ func (jav *JavDB) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
 			return jav.getMovieInfoByNumber(base, id)
 		}
 		return jav.getMovieInfoByDetailURL(base, jav.detailURL(base, id), id)
+	}, func() (*model.MovieInfo, error) {
+		api := jav.appAPIClient()
+		if api == nil {
+			return nil, errAppAPIUnavailable
+		}
+		if isNumberLike(id) {
+			return api.movieInfoByNumber(context.Background(), id)
+		}
+		return api.movieInfo(context.Background(), id)
 	})
 }
 
@@ -403,12 +438,23 @@ func (jav *JavDB) SearchMovie(keyword string) ([]*model.MovieSearchResult, error
 			return nil, err
 		}
 		return jav.filterSearchResults(results, keyword), nil
+	}, func() ([]*model.MovieSearchResult, error) {
+		api := jav.appAPIClient()
+		if api == nil {
+			return nil, errAppAPIUnavailable
+		}
+		results, err := api.search(context.Background(), keyword)
+		if err != nil {
+			return nil, err
+		}
+		return jav.filterSearchResults(results, keyword), nil
 	})
 }
 
 func executeWithDomainPolicy[T any](
 	jav *JavDB,
 	operation func(base *url.URL) (T, error),
+	appFallback ...func() (T, error),
 ) (T, error) {
 	jav.domainPolicyMu.Lock()
 	defer jav.domainPolicyMu.Unlock()
@@ -432,7 +478,28 @@ func executeWithDomainPolicy[T any](
 			jav.clearDomainFailuresLocked()
 			return value, nil
 		}
-		if loginRequired || stopDomainFallback(err) {
+		if loginRequired {
+			var appErr error
+			if len(appFallback) > 0 && appFallback[0] != nil {
+				value, err := appFallback[0]()
+				if err == nil {
+					jav.clearDomainFailuresLocked()
+					return value, nil
+				}
+				if !errors.Is(err, errAppAPIUnavailable) {
+					appErr = err
+				}
+			}
+			jav.clearDomainFailuresLocked()
+			if appErr != nil {
+				var zero T
+				return zero, fmt.Errorf("App API fallback failed: %v; website login required: %w",
+					appErr, err)
+			}
+			var zero T
+			return zero, err
+		}
+		if stopDomainFallback(err) {
 			jav.clearDomainFailuresLocked()
 			return value, err
 		}
@@ -460,6 +527,18 @@ func executeWithDomainPolicy[T any](
 		// The authenticated main site is only a fallback when an anonymous
 		// backup explicitly requires a login. Ordinary failures never reach it.
 		if loginRequired {
+			var appErr error
+			if len(appFallback) > 0 && appFallback[0] != nil {
+				value, err := appFallback[0]()
+				if err == nil {
+					jav.clearDomainFailuresLocked()
+					return value, nil
+				}
+				if !errors.Is(err, errAppAPIUnavailable) {
+					appErr = err
+				}
+			}
+
 			value, err, requiresLogin := runDomainAttempts(operation, primary)
 			if err == nil {
 				jav.clearDomainFailuresLocked()
@@ -468,6 +547,9 @@ func executeWithDomainPolicy[T any](
 			if requiresLogin || stopDomainFallback(err) {
 				jav.clearDomainFailuresLocked()
 				return value, err
+			}
+			if appErr != nil {
+				err = fmt.Errorf("App API fallback failed: %v; website fallback failed: %w", appErr, err)
 			}
 			lastErr = err
 		}
@@ -500,7 +582,7 @@ func (jav *JavDB) startDomainCooldownLocked(now time.Time) {
 }
 
 func (jav *JavDB) searchMovie(base *url.URL, keyword string) ([]*model.MovieSearchResult, error) {
-	body, err := jav.fetchPage(jav.searchURL(base, keyword), jav.isPrimaryURL(base))
+	body, err := jav.fetchPage(jav.searchURL(base, keyword))
 	if err != nil {
 		return nil, err
 	}
@@ -576,17 +658,15 @@ func (jav *JavDB) getMovieInfoByNumber(base *url.URL, n string) (*model.MovieInf
 }
 
 func (jav *JavDB) getMovieInfoByDetailURL(base *url.URL, rawURL, id string) (*model.MovieInfo, error) {
-	body, err := jav.fetchPage(rawURL, jav.isPrimaryURL(base))
+	body, err := jav.fetchPage(rawURL)
 	if err != nil {
 		return nil, err
 	}
 	return jav.parseMovieInfo(base, body, id, rawURL)
 }
 
-func (jav *JavDB) fetchPage(rawURL string, allowAuthorization bool) ([]byte, error) {
+func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 	c := jav.ClonedCollector()
-	authorizedOrigin := jav.URL()
-	authorization := jav.authorizationForURL(rawURL, allowAuthorization, authorizedOrigin)
 
 	var (
 		body        []byte
@@ -596,9 +676,6 @@ func (jav *JavDB) fetchPage(rawURL string, allowAuthorization bool) ([]byte, err
 		referer := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}).String()
 		c.OnRequest(func(r *colly.Request) {
 			r.Headers.Set("Referer", referer)
-			if authorization != "" && sameOrigin(authorizedOrigin, r.URL) {
-				r.Headers.Set("Authorization", authorization)
-			}
 		})
 	}
 	c.OnResponse(func(r *colly.Response) {
@@ -652,40 +729,21 @@ func normalizeAuthorization(value string) (string, error) {
 	if strings.ContainsAny(value, "\r\n") {
 		return "", errors.New("JavDB Authorization contains invalid line breaks")
 	}
-	return "Bearer " + value, nil
-}
-
-func sameOrigin(a, b *url.URL) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
-}
-
-func (jav *JavDB) isPrimaryURL(target *url.URL) bool {
-	return sameOrigin(jav.URL(), target)
-}
-
-func (jav *JavDB) authorizationForURL(rawURL string, allow bool, primary *url.URL) string {
-	if !allow {
-		return ""
-	}
-	target, err := url.Parse(rawURL)
-	if err != nil || !sameOrigin(primary, target) {
-		return ""
-	}
-
-	jav.sessionMu.Lock()
-	defer jav.sessionMu.Unlock()
-	return jav.sessionAuthorization
+	return value, nil
 }
 
 func (jav *JavDB) clearSessionStateLocked() error {
 	if err := jav.clearSessionCookies(); err != nil {
 		return err
 	}
-	jav.sessionAuthorization = ""
+	jav.sessionAppAPI = nil
 	return nil
+}
+
+func (jav *JavDB) appAPIClient() *javDBAppAPI {
+	jav.sessionMu.Lock()
+	defer jav.sessionMu.Unlock()
+	return jav.sessionAppAPI
 }
 
 func (jav *JavDB) clearSessionCookies() error {
@@ -747,7 +805,7 @@ func (jav *JavDB) rememberSessionDomainLocked(domain string) {
 func (jav *JavDB) loginWithPassword(username, password string) (provider.SessionStatus, error) {
 	base := jav.URL()
 	signinURL := base.ResolveReference(&url.URL{Path: "/login"}).String()
-	body, err := jav.fetchPage(signinURL, false)
+	body, err := jav.fetchPage(signinURL)
 	if err != nil {
 		return provider.SessionStatus{}, err
 	}
@@ -1097,22 +1155,15 @@ func equivalentMovieNumbers(left, right string) bool {
 		return true
 	}
 
-	leftHyphen := strings.ReplaceAll(left, "_", "-")
-	rightHyphen := strings.ReplaceAll(right, "_", "-")
-	if leftHyphen == rightHyphen {
-		return true
-	}
-
-	leftParts := numberPartsPattern.FindStringSubmatch(leftHyphen)
-	rightParts := numberPartsPattern.FindStringSubmatch(rightHyphen)
+	leftParts := numberPartsPattern.FindStringSubmatch(left)
+	rightParts := numberPartsPattern.FindStringSubmatch(right)
 	if len(leftParts) == 4 && len(rightParts) == 4 {
 		return leftParts[1] == rightParts[1] &&
 			trimLeadingZeros(leftParts[2]) == trimLeadingZeros(rightParts[2]) &&
 			leftParts[3] == rightParts[3]
 	}
 
-	return strings.NewReplacer("-", "", "_", "").Replace(left) ==
-		strings.NewReplacer("-", "", "_", "").Replace(right)
+	return false
 }
 
 func normalizeNumberKey(value string) string {

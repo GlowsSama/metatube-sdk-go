@@ -230,12 +230,22 @@ func TestJavDBSessionConfig(t *testing.T) {
 		assert.NotContains(t, rec.Body.String(), "user@example.com")
 	})
 
-	t.Run("applies authorization without returning it", func(t *testing.T) {
-		rec, response := send(`{"authorization":"Authorization: Bearer secret-token"}`, testToken)
+	t.Run("applies App API authorization without returning it", func(t *testing.T) {
+		rec, response := send(
+			`{"authorization":"Authorization: Bearer secret-token","api_url":"https://api.example/api"}`,
+			testToken)
 		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 		assert.True(t, response.Data.Configured)
 		assert.True(t, response.Data.Authenticated)
-		assert.Equal(t, "authorization", response.Data.Mode)
+		assert.Equal(t, "app_api", response.Data.Mode)
+		assert.NotContains(t, rec.Body.String(), "secret-token")
+	})
+
+	t.Run("rejects invalid App API URL without returning credentials", func(t *testing.T) {
+		rec, response := send(
+			`{"authorization":"Bearer secret-token","api_url":"file:///tmp/javdb"}`, testToken)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, response.Error.Message, "absolute HTTP URL")
 		assert.NotContains(t, rec.Body.String(), "secret-token")
 	})
 
