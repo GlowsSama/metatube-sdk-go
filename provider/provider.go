@@ -111,7 +111,7 @@ type SessionStatus struct {
 
 type SessionConfigurer interface {
 	// ConfigureSession applies an authenticated browsing session.
-	ConfigureSession(username, password, cookie string) (SessionStatus, error)
+	ConfigureSession(username, password, cookie, authorization string) (SessionStatus, error)
 }
 
 type DomainSetter interface {

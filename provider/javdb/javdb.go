@@ -69,15 +69,17 @@ const (
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
-	domains             *domainpool.Pool
-	domainMu            sync.RWMutex
-	primaryDomain       *url.URL
-	sessionMu           sync.Mutex
-	sessionDomains      map[string]struct{}
-	domainPolicyMu      sync.Mutex
-	domainFailureRounds int
-	domainCooldownUntil time.Time
-	now                 func() time.Time
+	domains              *domainpool.Pool
+	domainMu             sync.RWMutex
+	primaryDomain        *url.URL
+	sessionConfigMu      sync.Mutex
+	sessionMu            sync.Mutex
+	sessionDomains       map[string]struct{}
+	sessionAuthorization string
+	domainPolicyMu       sync.Mutex
+	domainFailureRounds  int
+	domainCooldownUntil  time.Time
+	now                  func() time.Time
 }
 
 func New() *JavDB {
@@ -121,6 +123,9 @@ func (jav *JavDB) SetBackupDomains(domains []string) error {
 }
 
 func (jav *JavDB) ConfigureDomains(primary *string, backups *[]string) (string, []string, error) {
+	jav.sessionConfigMu.Lock()
+	defer jav.sessionConfigMu.Unlock()
+
 	var normalizedPrimary *url.URL
 	if primary != nil {
 		domain := strings.TrimSpace(*primary)
@@ -153,7 +158,7 @@ func (jav *JavDB) ConfigureDomains(primary *string, backups *[]string) (string, 
 
 		jav.sessionMu.Lock()
 		if target != current {
-			if err := jav.clearSessionCookies(); err != nil {
+			if err := jav.clearSessionStateLocked(); err != nil {
 				jav.sessionMu.Unlock()
 				return "", nil, err
 			}
@@ -203,19 +208,30 @@ func runDomainAttempts[T any](
 	return zero, lastErr, false
 }
 
-// ConfigureSession applies a JavDB browser cookie or attempts a password
-// login. JavDB may require an image captcha, which this client cannot solve.
-func (jav *JavDB) ConfigureSession(username, password, cookie string) (provider.SessionStatus, error) {
+// ConfigureSession applies one JavDB login method. Authorization has priority
+// over cookie, and cookie has priority over account credentials. JavDB may
+// require an image captcha, which this client cannot solve.
+func (jav *JavDB) ConfigureSession(
+	username, password, cookie, authorization string,
+) (provider.SessionStatus, error) {
 	username = strings.TrimSpace(username)
 	cookie = strings.TrimSpace(cookie)
+	authorization, err := normalizeAuthorization(authorization)
+	if err != nil {
+		return provider.SessionStatus{}, err
+	}
+
+	jav.sessionConfigMu.Lock()
+	defer jav.sessionConfigMu.Unlock()
 
 	jav.sessionMu.Lock()
-	defer jav.sessionMu.Unlock()
 
-	if username == "" && password == "" && cookie == "" {
-		if err := jav.clearSessionCookies(); err != nil {
+	if username == "" && password == "" && cookie == "" && authorization == "" {
+		if err := jav.clearSessionStateLocked(); err != nil {
+			jav.sessionMu.Unlock()
 			return provider.SessionStatus{}, err
 		}
+		jav.sessionMu.Unlock()
 		return provider.SessionStatus{
 			Configured: false,
 			Mode:       "none",
@@ -223,18 +239,33 @@ func (jav *JavDB) ConfigureSession(username, password, cookie string) (provider.
 		}, nil
 	}
 
-	if err := jav.clearSessionCookies(); err != nil {
+	if err := jav.clearSessionStateLocked(); err != nil {
+		jav.sessionMu.Unlock()
 		return provider.SessionStatus{}, err
+	}
+
+	if authorization != "" {
+		jav.sessionAuthorization = authorization
+		jav.sessionMu.Unlock()
+		return provider.SessionStatus{
+			Configured:    true,
+			Authenticated: true,
+			Mode:          "authorization",
+			Message:       "JavDB Authorization 已应用；仅在主站登录兜底时使用",
+		}, nil
 	}
 
 	if cookie != "" {
 		cookies, err := parseCookieHeader(cookie)
 		if err != nil {
+			jav.sessionMu.Unlock()
 			return provider.SessionStatus{}, err
 		}
 		if err := jav.applySessionCookies(cookies); err != nil {
+			jav.sessionMu.Unlock()
 			return provider.SessionStatus{}, err
 		}
+		jav.sessionMu.Unlock()
 		return provider.SessionStatus{
 			Configured:    true,
 			Authenticated: true,
@@ -244,15 +275,20 @@ func (jav *JavDB) ConfigureSession(username, password, cookie string) (provider.
 	}
 
 	if username == "" || password == "" {
+		jav.sessionMu.Unlock()
 		return provider.SessionStatus{
 			Configured: false,
 			Mode:       "password",
 			Message:    "JavDB 账号和密码需要同时填写",
 		}, nil
 	}
+	jav.sessionMu.Unlock()
+
 	status, err := jav.loginWithPassword(username, password)
 	if err == nil && status.Authenticated {
+		jav.sessionMu.Lock()
 		jav.rememberSessionDomainLocked(jav.URL().String())
+		jav.sessionMu.Unlock()
 	}
 	return status, err
 }
@@ -464,7 +500,7 @@ func (jav *JavDB) startDomainCooldownLocked(now time.Time) {
 }
 
 func (jav *JavDB) searchMovie(base *url.URL, keyword string) ([]*model.MovieSearchResult, error) {
-	body, err := jav.fetchPage(jav.searchURL(base, keyword))
+	body, err := jav.fetchPage(jav.searchURL(base, keyword), jav.isPrimaryURL(base))
 	if err != nil {
 		return nil, err
 	}
@@ -540,15 +576,17 @@ func (jav *JavDB) getMovieInfoByNumber(base *url.URL, n string) (*model.MovieInf
 }
 
 func (jav *JavDB) getMovieInfoByDetailURL(base *url.URL, rawURL, id string) (*model.MovieInfo, error) {
-	body, err := jav.fetchPage(rawURL)
+	body, err := jav.fetchPage(rawURL, jav.isPrimaryURL(base))
 	if err != nil {
 		return nil, err
 	}
 	return jav.parseMovieInfo(base, body, id, rawURL)
 }
 
-func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
+func (jav *JavDB) fetchPage(rawURL string, allowAuthorization bool) ([]byte, error) {
 	c := jav.ClonedCollector()
+	authorizedOrigin := jav.URL()
+	authorization := jav.authorizationForURL(rawURL, allowAuthorization, authorizedOrigin)
 
 	var (
 		body        []byte
@@ -558,6 +596,9 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 		referer := (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/"}).String()
 		c.OnRequest(func(r *colly.Request) {
 			r.Headers.Set("Referer", referer)
+			if authorization != "" && sameOrigin(authorizedOrigin, r.URL) {
+				r.Headers.Set("Authorization", authorization)
+			}
 		})
 	}
 	c.OnResponse(func(r *colly.Response) {
@@ -589,6 +630,62 @@ func (jav *JavDB) fetchPage(rawURL string) ([]byte, error) {
 		return nil, fmt.Errorf("%s: empty response", jav.Name())
 	}
 	return body, nil
+}
+
+func normalizeAuthorization(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "authorization:") {
+		value = strings.TrimSpace(value[len("authorization:"):])
+		lower = strings.ToLower(value)
+	}
+	if strings.HasPrefix(lower, "bearer ") {
+		value = strings.TrimSpace(value[len("bearer "):])
+	}
+	if value == "" {
+		return "", errors.New("JavDB Authorization is empty")
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return "", errors.New("JavDB Authorization contains invalid line breaks")
+	}
+	return "Bearer " + value, nil
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+}
+
+func (jav *JavDB) isPrimaryURL(target *url.URL) bool {
+	return sameOrigin(jav.URL(), target)
+}
+
+func (jav *JavDB) authorizationForURL(rawURL string, allow bool, primary *url.URL) string {
+	if !allow {
+		return ""
+	}
+	target, err := url.Parse(rawURL)
+	if err != nil || !sameOrigin(primary, target) {
+		return ""
+	}
+
+	jav.sessionMu.Lock()
+	defer jav.sessionMu.Unlock()
+	return jav.sessionAuthorization
+}
+
+func (jav *JavDB) clearSessionStateLocked() error {
+	if err := jav.clearSessionCookies(); err != nil {
+		return err
+	}
+	jav.sessionAuthorization = ""
+	return nil
 }
 
 func (jav *JavDB) clearSessionCookies() error {
@@ -650,7 +747,7 @@ func (jav *JavDB) rememberSessionDomainLocked(domain string) {
 func (jav *JavDB) loginWithPassword(username, password string) (provider.SessionStatus, error) {
 	base := jav.URL()
 	signinURL := base.ResolveReference(&url.URL{Path: "/login"}).String()
-	body, err := jav.fetchPage(signinURL)
+	body, err := jav.fetchPage(signinURL, false)
 	if err != nil {
 		return provider.SessionStatus{}, err
 	}

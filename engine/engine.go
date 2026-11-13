@@ -264,9 +264,10 @@ func (e *Engine) SetProviderPrimaryDomain(name, domain string) (string, error) {
 	return normalized, err
 }
 
-// SetJavDBSession applies a cookie or account session to the JavDB provider.
+// SetJavDBSession applies an authorization, cookie, or account session to the
+// JavDB provider.
 // Credentials are never written to the engine log.
-func (e *Engine) SetJavDBSession(username, password, cookie string) (mt.SessionStatus, error) {
+func (e *Engine) SetJavDBSession(username, password, cookie, authorization string) (mt.SessionStatus, error) {
 	provider, err := e.GetMovieProviderByName("JavDB")
 	if err != nil {
 		return mt.SessionStatus{}, err
@@ -276,7 +277,7 @@ func (e *Engine) SetJavDBSession(username, password, cookie string) (mt.SessionS
 		return mt.SessionStatus{}, fmt.Errorf("provider %s does not support sessions", provider.Name())
 	}
 
-	status, err := configurer.ConfigureSession(username, password, cookie)
+	status, err := configurer.ConfigureSession(username, password, cookie, authorization)
 	if err != nil {
 		return mt.SessionStatus{}, fmt.Errorf("configure %s session: %w", provider.Name(), err)
 	}

@@ -358,7 +358,7 @@ func TestJavDB_FallsBackToPrimaryAfterBackupLoginRequired(t *testing.T) {
 	primaryURL := strings.Replace(primary.URL, "127.0.0.1", "localhost", 1)
 	jav.Scraper = scraper.NewDefaultScraper(Name, primaryURL, Priority, language.Chinese)
 	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
-	_, err := jav.ConfigureSession("", "", "session=primary-only")
+	_, err := jav.ConfigureSession("", "", "session=primary-only", "")
 	require.NoError(t, err)
 
 	info, err := jav.GetMovieInfoByID("wKg2O2")
@@ -450,7 +450,7 @@ func TestJavDB_ConfigureSessionCookieAndClear(t *testing.T) {
 			card("cookie", "SONE-065", "Cookie session", "/cover.jpg")+`</div>`)
 	})
 
-	status, err := jav.ConfigureSession("", "", "Cookie: session=abc; cf_clearance=token")
+	status, err := jav.ConfigureSession("", "", "Cookie: session=abc; cf_clearance=token", "")
 	require.NoError(t, err)
 	assert.True(t, status.Configured)
 	assert.True(t, status.Authenticated)
@@ -462,7 +462,7 @@ func TestJavDB_ConfigureSessionCookieAndClear(t *testing.T) {
 	assert.Contains(t, cookies[0], "session=abc")
 	assert.Contains(t, cookies[0], "cf_clearance=token")
 
-	status, err = jav.ConfigureSession("", "", "")
+	status, err = jav.ConfigureSession("", "", "", "")
 	require.NoError(t, err)
 	assert.False(t, status.Configured)
 	assert.Equal(t, "none", status.Mode)
@@ -471,6 +471,141 @@ func TestJavDB_ConfigureSessionCookieAndClear(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, cookies, 2)
 	assert.Empty(t, cookies[1])
+}
+
+func TestNormalizeAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "empty"},
+		{name: "raw token", input: "raw-token", want: "Bearer raw-token"},
+		{name: "bearer token", input: "Bearer raw-token", want: "Bearer raw-token"},
+		{name: "lowercase bearer", input: "bearer raw-token", want: "Bearer raw-token"},
+		{name: "authorization header", input: "Authorization: Bearer raw-token",
+			want: "Bearer raw-token"},
+		{name: "authorization header without scheme", input: "authorization: raw-token",
+			want: "Bearer raw-token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeAuthorization(tc.input)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	_, err := normalizeAuthorization("Bearer token\r\nX-Injected: true")
+	require.Error(t, err)
+}
+
+func TestJavDB_AuthorizationPriorityAndClear(t *testing.T) {
+	var authorizations, cookies []string
+	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/search", r.URL.Path)
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		cookies = append(cookies, r.Header.Get("Cookie"))
+		fmt.Fprint(w, `<div class="movie-list">`+
+			card("authorization", "SONE-065", "Authorization session", "/cover.jpg")+`</div>`)
+	})
+
+	status, err := jav.ConfigureSession(
+		"user@example.com",
+		"secret-password",
+		"session=ignored",
+		"Authorization: Bearer raw-token",
+	)
+	require.NoError(t, err)
+	assert.True(t, status.Configured)
+	assert.True(t, status.Authenticated)
+	assert.Equal(t, "authorization", status.Mode)
+	assert.NotContains(t, status.Message, "raw-token")
+
+	_, err = jav.SearchMovie("SONE-065")
+	require.NoError(t, err)
+	require.Len(t, authorizations, 1)
+	assert.Equal(t, "Bearer raw-token", authorizations[0])
+	assert.Empty(t, cookies[0])
+
+	status, err = jav.ConfigureSession("", "", "", "")
+	require.NoError(t, err)
+	assert.False(t, status.Configured)
+
+	_, err = jav.SearchMovie("SONE-065")
+	require.NoError(t, err)
+	require.Len(t, authorizations, 2)
+	assert.Empty(t, authorizations[1])
+	assert.Empty(t, cookies[1])
+}
+
+func TestJavDB_AuthorizationOnlySentToPrimaryFallback(t *testing.T) {
+	var primaryAuthorizations, backupAuthorizations []string
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryAuthorizations = append(primaryAuthorizations, r.Header.Get("Authorization"))
+		fmt.Fprint(w, detailPage("SONE-065", "Primary authorization title", "/primary-cover.jpg"))
+	}))
+	t.Cleanup(primary.Close)
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupAuthorizations = append(backupAuthorizations, r.Header.Get("Authorization"))
+		fmt.Fprint(w, `<html><head><title>登入 - JavDB</title></head><body><form action="/login"><input type="password" name="password"></form></body></html>`)
+	}))
+	t.Cleanup(backup.Close)
+
+	jav := New()
+	primaryURL := strings.Replace(primary.URL, "127.0.0.1", "localhost", 1)
+	jav.Scraper = scraper.NewDefaultScraper(Name, primaryURL, Priority, language.Chinese)
+	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
+	_, err := jav.ConfigureSession("", "", "", "primary-token")
+	require.NoError(t, err)
+
+	info, err := jav.GetMovieInfoByID("wKg2O2")
+	require.NoError(t, err)
+	assert.Equal(t, "Primary authorization title", info.Title)
+	require.Len(t, backupAuthorizations, 1)
+	assert.Empty(t, backupAuthorizations[0])
+	require.Len(t, primaryAuthorizations, 1)
+	assert.Equal(t, "Bearer primary-token", primaryAuthorizations[0])
+}
+
+func TestJavDB_AuthorizationNotForwardedAcrossRedirect(t *testing.T) {
+	var backupHits int
+	var primaryAuthorizations, backupAuthorizations []string
+	var backupURL string
+
+	backup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backupHits++
+		backupAuthorizations = append(backupAuthorizations, r.Header.Get("Authorization"))
+		if backupHits == 1 {
+			fmt.Fprint(w, `<html><head><title>登入 - JavDB</title></head><body><form action="/login"><input type="password" name="password"></form></body></html>`)
+			return
+		}
+		fmt.Fprint(w, detailPage("SONE-065", "Redirected title", "/redirected-cover.jpg"))
+	}))
+	t.Cleanup(backup.Close)
+	backupURL = backup.URL
+
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryAuthorizations = append(primaryAuthorizations, r.Header.Get("Authorization"))
+		http.Redirect(w, r, backupURL+"/v/redirected", http.StatusFound)
+	}))
+	t.Cleanup(primary.Close)
+
+	jav := New()
+	primaryURL := strings.Replace(primary.URL, "127.0.0.1", "localhost", 1)
+	jav.Scraper = scraper.NewDefaultScraper(Name, primaryURL, Priority, language.Chinese)
+	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
+	_, err := jav.ConfigureSession("", "", "", "primary-token")
+	require.NoError(t, err)
+
+	info, err := jav.GetMovieInfoByID("wKg2O2")
+	require.NoError(t, err)
+	assert.Equal(t, "Redirected title", info.Title)
+	require.Len(t, primaryAuthorizations, 1)
+	assert.Equal(t, "Bearer primary-token", primaryAuthorizations[0])
+	require.Len(t, backupAuthorizations, 2)
+	assert.Empty(t, backupAuthorizations[0])
+	assert.Empty(t, backupAuthorizations[1])
 }
 
 func TestJavDB_SessionCookiesOnlyApplyToPrimaryDomain(t *testing.T) {
@@ -493,7 +628,7 @@ func TestJavDB_SessionCookiesOnlyApplyToPrimaryDomain(t *testing.T) {
 	primaryURL := strings.Replace(primary.URL, "127.0.0.1", "localhost", 1)
 	jav.Scraper = scraper.NewDefaultScraper(Name, primaryURL, Priority, language.Chinese)
 	require.NoError(t, jav.SetBackupDomains([]string{backup.URL}))
-	_, err := jav.ConfigureSession("", "", "session=primary-only")
+	_, err := jav.ConfigureSession("", "", "session=primary-only", "")
 	require.NoError(t, err)
 
 	_, err = jav.SearchMovie("SONE-065")
@@ -520,7 +655,7 @@ func TestJavDB_SetPrimaryDomainClearsPreviousSessionCookies(t *testing.T) {
 	jav := New()
 	oldPrimaryURL := strings.Replace(oldPrimary.URL, "127.0.0.1", "localhost", 1)
 	jav.Scraper = scraper.NewDefaultScraper(Name, oldPrimaryURL, Priority, language.Chinese)
-	_, err := jav.ConfigureSession("", "", "session=old-primary")
+	_, err := jav.ConfigureSession("", "", "session=old-primary", "")
 	require.NoError(t, err)
 
 	require.NoError(t, jav.SetPrimaryDomain(newPrimary.URL))
@@ -531,6 +666,38 @@ func TestJavDB_SetPrimaryDomainClearsPreviousSessionCookies(t *testing.T) {
 	require.Len(t, results, 1)
 	require.Len(t, oldPrimaryCookies, 1)
 	assert.Empty(t, oldPrimaryCookies[0])
+}
+
+func TestJavDB_SetPrimaryDomainClearsPreviousAuthorization(t *testing.T) {
+	var oldPrimaryAuthorizations, newPrimaryAuthorizations []string
+	oldPrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		oldPrimaryAuthorizations = append(oldPrimaryAuthorizations, r.Header.Get("Authorization"))
+		fmt.Fprint(w, `<html><head><title>登入 - JavDB</title></head><body><form action="/login"><input type="password" name="password"></form></body></html>`)
+	}))
+	t.Cleanup(oldPrimary.Close)
+
+	newPrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		newPrimaryAuthorizations = append(newPrimaryAuthorizations, r.Header.Get("Authorization"))
+		fmt.Fprint(w, detailPage("SONE-065", "New primary title", "/new-primary-cover.jpg"))
+	}))
+	t.Cleanup(newPrimary.Close)
+
+	jav := New()
+	oldPrimaryURL := strings.Replace(oldPrimary.URL, "127.0.0.1", "localhost", 1)
+	jav.Scraper = scraper.NewDefaultScraper(Name, oldPrimaryURL, Priority, language.Chinese)
+	_, err := jav.ConfigureSession("", "", "", "old-primary-token")
+	require.NoError(t, err)
+
+	require.NoError(t, jav.SetPrimaryDomain(newPrimary.URL))
+	require.NoError(t, jav.SetBackupDomains([]string{oldPrimary.URL}))
+
+	info, err := jav.GetMovieInfoByID("wKg2O2")
+	require.NoError(t, err)
+	assert.Equal(t, "New primary title", info.Title)
+	require.Len(t, oldPrimaryAuthorizations, 1)
+	assert.Empty(t, oldPrimaryAuthorizations[0])
+	require.Len(t, newPrimaryAuthorizations, 1)
+	assert.Empty(t, newPrimaryAuthorizations[0])
 }
 
 func TestJavDB_ConfigureSessionWithPassword(t *testing.T) {
@@ -562,7 +729,7 @@ func TestJavDB_ConfigureSessionWithPassword(t *testing.T) {
 		}
 	})
 
-	status, err := jav.ConfigureSession("user@example.com", " secret-password ", "")
+	status, err := jav.ConfigureSession("user@example.com", " secret-password ", "", "")
 	require.NoError(t, err)
 	assert.True(t, status.Configured)
 	assert.True(t, status.Authenticated)
@@ -586,7 +753,7 @@ func TestJavDB_ConfigureSessionStopsAtCaptcha(t *testing.T) {
 </form></body></html>`)
 	})
 
-	status, err := jav.ConfigureSession("user@example.com", "secret-password", "")
+	status, err := jav.ConfigureSession("user@example.com", "secret-password", "", "")
 	require.NoError(t, err)
 	assert.True(t, status.Configured)
 	assert.False(t, status.Authenticated)

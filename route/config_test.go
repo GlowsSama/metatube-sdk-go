@@ -230,6 +230,15 @@ func TestJavDBSessionConfig(t *testing.T) {
 		assert.NotContains(t, rec.Body.String(), "user@example.com")
 	})
 
+	t.Run("applies authorization without returning it", func(t *testing.T) {
+		rec, response := send(`{"authorization":"Authorization: Bearer secret-token"}`, testToken)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.True(t, response.Data.Configured)
+		assert.True(t, response.Data.Authenticated)
+		assert.Equal(t, "authorization", response.Data.Mode)
+		assert.NotContains(t, rec.Body.String(), "secret-token")
+	})
+
 	t.Run("clears session", func(t *testing.T) {
 		rec, response := send(`{}`, testToken)
 		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())

@@ -19,9 +19,10 @@ type domainsConfig struct {
 }
 
 type javDBSessionConfig struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Cookie   string `json:"cookie"`
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	Cookie        string `json:"cookie"`
+	Authorization string `json:"authorization"`
 }
 
 func setFlareSolverr(app *engine.Engine) gin.HandlerFunc {
@@ -112,7 +113,8 @@ func setJavDBSession(app *engine.Engine) gin.HandlerFunc {
 			return
 		}
 
-		status, err := app.SetJavDBSession(config.Username, config.Password, config.Cookie)
+		status, err := app.SetJavDBSession(config.Username, config.Password, config.Cookie,
+			config.Authorization)
 		if err != nil {
 			abortWithStatusMessage(c, http.StatusBadRequest, err)
 			return
