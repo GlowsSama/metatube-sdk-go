@@ -493,7 +493,7 @@ func executeWithDomainPolicy[T any](
 			jav.clearDomainFailuresLocked()
 			if appErr != nil {
 				var zero T
-				return zero, fmt.Errorf("App API fallback failed: %v; website login required: %w",
+				return zero, fmt.Errorf("app API fallback failed: %v; website login required: %w",
 					appErr, err)
 			}
 			var zero T
@@ -549,7 +549,7 @@ func executeWithDomainPolicy[T any](
 				return value, err
 			}
 			if appErr != nil {
-				err = fmt.Errorf("App API fallback failed: %v; website fallback failed: %w", appErr, err)
+				err = fmt.Errorf("app API fallback failed: %v; website fallback failed: %w", appErr, err)
 			}
 			lastErr = err
 		}
