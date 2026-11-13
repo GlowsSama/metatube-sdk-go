@@ -483,10 +483,14 @@ func TestNormalizeAuthorization(t *testing.T) {
 		{name: "raw token", input: "raw-token", want: "Bearer raw-token"},
 		{name: "bearer token", input: "Bearer raw-token", want: "Bearer raw-token"},
 		{name: "lowercase bearer", input: "bearer raw-token", want: "Bearer raw-token"},
-		{name: "authorization header", input: "Authorization: Bearer raw-token",
-			want: "Bearer raw-token"},
-		{name: "authorization header without scheme", input: "authorization: raw-token",
-			want: "Bearer raw-token"},
+		{
+			name: "authorization header", input: "Authorization: Bearer raw-token",
+			want: "Bearer raw-token",
+		},
+		{
+			name: "authorization header without scheme", input: "authorization: raw-token",
+			want: "Bearer raw-token",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := normalizeAuthorization(tc.input)
