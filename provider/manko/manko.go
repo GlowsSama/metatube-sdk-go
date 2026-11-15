@@ -282,6 +282,14 @@ func (m *Manko) parseSearchResults(body []byte, keyword string) ([]*model.MovieS
 		}
 		seen[id] = struct{}{}
 
+		title := firstText(card.Find("div.title span").First())
+		if title == "" {
+			title = firstAttr(link, "title")
+		}
+		if title == "" {
+			title = id
+		}
+
 		cover := ""
 		if style, ok := card.Find(`div[style*="background-image"]`).First().Attr("style"); ok {
 			if match := backgroundImageRe.FindStringSubmatch(style); len(match) == 2 {
@@ -292,7 +300,7 @@ func (m *Manko) parseSearchResults(body []byte, keyword string) ([]*model.MovieS
 		result := &model.MovieSearchResult{
 			ID:          id,
 			Number:      id,
-			Title:       id,
+			Title:       javnumber.CleanTitle(title, id),
 			Provider:    Name,
 			Homepage:    homepage,
 			ThumbURL:    cover,

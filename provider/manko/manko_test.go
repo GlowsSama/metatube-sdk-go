@@ -40,13 +40,17 @@ func newTestManko(t *testing.T, handler http.HandlerFunc) *Manko {
 }
 
 func mankoCard(number, href, cover, date, score string) string {
+	return mankoCardWithTitle(number, number, href, cover, date, score)
+}
+
+func mankoCardWithTitle(number, title, href, cover, date, score string) string {
 	return fmt.Sprintf(`<div class="border border-gray-dark rounded-lg">
 <a class="relative block" href="%s"><div style="background-image: url(&quot;%s&quot;); background-size: cover;"></div></a>
 <div class="p-3">
-  <div class="flex justify-between"><a title="%s" href="%s">%s</a></div>
+  <div class="flex justify-between"><a title="%s" href="%s"><div class="title"><strong>%s</strong><span>%s</span></div></a></div>
   <div><span class="text-gray-300">%s</span><button aria-label="Copy IMDb ID, rating: %s">%s</button></div>
 </div>
-</div>`, href, cover, number, href, number, date, score, score)
+</div>`, href, cover, number, href, number, title, date, score, score)
 }
 
 func mankoDetailPage() string {
@@ -113,7 +117,8 @@ func TestManko_SearchFiltersVariantsAndDuplicates(t *testing.T) {
 	body := mankoCard("IPZZ-950", "/movie-info/aaaaaaaaaaaaaaaaaaaaaaaa", "/related.webp", "2020-01-01", "3.00") +
 		mankoCard("IPZ-950-Uncensored", "/movie-info/bbbbbbbbbbbbbbbbbbbbbbbb", "/uncensored.webp", "2020-01-01", "3.00") +
 		mankoCard("IPZ-950-English-Subtitle", "/movie-info/cccccccccccccccccccccccc", "/subtitle.webp", "2020-01-01", "3.00") +
-		mankoCard("IPZ-950", "/movie-info/"+testHash, testCover, "2017-05-24", "4.55") +
+		mankoCardWithTitle("IPZ-950", "IPZ-950 IPZ-950 Attacker's Full Supervision",
+			"/movie-info/"+testHash, testCover, "2017-05-24", "4.55") +
 		mankoCard("IPZ-950", "/movie-info/"+testHash+"?series=false", "/duplicate.webp", "2017-05-24", "4.55")
 
 	results, err := New().parseSearchResults([]byte(body), "IPZ-950")
@@ -121,12 +126,22 @@ func TestManko_SearchFiltersVariantsAndDuplicates(t *testing.T) {
 	require.Len(t, results, 1)
 	assert.Equal(t, "IPZ-950", results[0].ID)
 	assert.Equal(t, "IPZ-950", results[0].Number)
-	assert.Equal(t, "IPZ-950", results[0].Title)
+	assert.Equal(t, "Attacker's Full Supervision", results[0].Title)
 	assert.InDelta(t, 4.55, results[0].Score, 0.001)
 	assert.Equal(t, testCover, results[0].CoverURL)
 	assert.Equal(t, testCover, results[0].ThumbURL)
 	assert.Equal(t, "2017-05-24", time.Time(results[0].ReleaseDate).Format("2006-01-02"))
 	assert.Contains(t, results[0].Homepage, "/movie-info/"+testHash)
+}
+
+func TestManko_SearchTitleFallsBackWithoutRepeatingNumber(t *testing.T) {
+	results, err := New().parseSearchResults(
+		[]byte(mankoCard("IPZ-950", "/movie-info/"+testHash, testCover, "2017-05-24", "4.55")),
+		"IPZ-950",
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "IPZ-950", results[0].Title)
 }
 
 func TestManko_ParseMovieInfo(t *testing.T) {
