@@ -284,13 +284,13 @@ func TestManko_APIPrefersJapaneseMetadata(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 
 		var payload []byte
-		switch {
-		case r.URL.Path == "/swx/movie/search":
+		switch r.URL.Path {
+		case "/swx/movie/search":
 			assert.Equal(t, "IPZ-950", r.URL.Query().Get("keyword"))
 			payload = searchPayload
-		case r.URL.Path == "/swx/movie/detail/"+testHash:
+		case "/swx/movie/detail/" + testHash:
 			payload = detailPayload
-		case r.URL.Path == "/swx/movie/actors/"+testHash:
+		case "/swx/movie/actors/" + testHash:
 			payload = actorPayload
 		default:
 			http.NotFound(w, r)
