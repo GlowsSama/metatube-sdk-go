@@ -31,11 +31,12 @@ func newTestManko(t *testing.T, handler http.HandlerFunc) *Manko {
 
 	m := New()
 	m.Fetcher = fetch.Default(&fetch.Config{Referer: server.URL + "/"})
-	m.Scraper = scraper.NewDefaultScraper(Name, server.URL+"/", Priority, language.English,
+	m.Scraper = scraper.NewDefaultScraper(Name, server.URL+"/", Priority, language.Japanese,
 		scraper.WithHeaders(map[string]string{
 			"Referer":         server.URL + "/",
-			"Accept-Language": "en-US,en;q=0.9",
+			"Accept-Language": "ja-JP,ja;q=0.9",
 		}))
+	m.apiHosts = []string{server.URL}
 	return m
 }
 
@@ -84,6 +85,30 @@ func mankoDetailPage() string {
 </body></html>`, testHash, testHash)
 }
 
+func mankoJapaneseDetailPage() string {
+	return fmt.Sprintf(`<!doctype html><html lang="ja"><head><title>作品情報 | Manko</title></head><body>
+<iframe src="https://sadie-shop.site/e/P8J1N6Z8?poster=https%%3A%%2F%%2Ficdn.123av.me%%2Fimg2%%2Fs500%%2Fb8%%2Fipz-950%%2Fcover.jpg%%3F6a3478d3"></iframe>
+<h1>アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな</h1>
+<div class="space-y-2 text-sm">
+  <div><span class="text-gray-400 font-medium">タイトル:</span><span class="text-white">IPZ-950</span></div>
+  <div><span class="text-gray-400 font-medium">あらすじ:</span><span class="text-white">アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな</span></div>
+  <div><span class="text-gray-400 font-medium">評価:</span><span class="text-yellow-400 font-bold">4.55</span></div>
+  <div><span class="text-gray-400 font-medium">再生時間:</span><span class="text-white">120 分</span></div>
+  <div><span class="text-gray-400 font-medium">メーカー:</span><span class="text-white">IDEA POCKET</span></div>
+  <div><span class="text-gray-400 font-medium">発売日:</span><span class="text-white">2017-05-24</span></div>
+  <div><span class="text-gray-400 font-medium">出演者:</span><span>
+    <a href="/actor/0dKX?name=桃乃木かな">桃乃木かな, </a>
+    <a href="/actor/x7wn?name=田淵正浩">田淵正浩</a>
+  </span></div>
+  <div>
+    <a href="/filter/genre/Solowork">Solowork</a>
+    <a href="/filter/genre/Drama">Drama</a>
+  </div>
+</div>
+<img alt="Backdrop 1" src="https://image.healertanker.com/%s/samples/xv/xve0n_l_0.jpg">
+</body></html>`, testHash)
+}
+
 func TestManko_NormalizeAndParseURL(t *testing.T) {
 	m := New()
 	for input, want := range map[string]string{
@@ -111,6 +136,18 @@ func TestManko_NormalizeAndParseURL(t *testing.T) {
 		_, err := m.ParseMovieIDFromURL(input)
 		assert.ErrorIs(t, err, provider.ErrInvalidURL, input)
 	}
+}
+
+func TestManko_DefaultURLsUseJapaneseLocale(t *testing.T) {
+	m := New()
+	assert.Equal(t,
+		"https://manko.fun/ja/searchresult?by=Title&keyword=IPZ-950",
+		m.searchURL("IPZ-950"),
+	)
+	assert.Equal(t,
+		"https://manko.fun/ja/movie-info/"+testHash,
+		m.detailURL(testHash),
+	)
 }
 
 func TestManko_SearchFiltersVariantsAndDuplicates(t *testing.T) {
@@ -169,6 +206,131 @@ func TestManko_ParseMovieInfo(t *testing.T) {
 	assert.Equal(t, homepage, info.Homepage)
 }
 
+func TestManko_ParseJapaneseMovieInfo(t *testing.T) {
+	homepage := "https://manko.fun/movie-info/" + testHash
+	info, err := New().parseMovieInfo([]byte(mankoJapaneseDetailPage()), testHash, homepage)
+	require.NoError(t, err)
+	require.True(t, info.IsValid())
+	assert.Equal(t, "アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな", info.Title)
+	assert.Equal(t, "アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな", info.Summary)
+	assert.Equal(t, "IDEA POCKET", info.Maker)
+	assert.Equal(t, []string{"桃乃木かな", "田淵正浩"}, []string(info.Actors))
+	assert.Equal(t, 120, info.Runtime)
+	assert.InDelta(t, 4.55, info.Score, 0.001)
+}
+
+func TestManko_DecodeAPIData(t *testing.T) {
+	payload := []byte(`{"title":"IPZ-950","language":"ja","overview":"日本語の概要"}`)
+	decoded, err := decodeMankoAPIData(encodeMankoAPIData(payload))
+	require.NoError(t, err)
+	assert.JSONEq(t, string(payload), string(decoded))
+}
+
+func TestManko_APIPrefersJapaneseMetadata(t *testing.T) {
+	searchPayload, err := json.Marshal([]mankoAPIMovie{{
+		ID:             testHash,
+		Title:          "IPZ-950",
+		Titles:         []mankoAPILocalizedTitle{{Language: "en", Title: "IPZ-950"}},
+		ReleaseDate:    "2017-05-24",
+		Rating:         "4.55",
+		IMDbScore:      "4.55",
+		ThumbnailImage: "https://image.healertanker.com/" + testHash + "/thumbs/xv/xve0n.jpg",
+		WideThumbnail:  "https://image.healertanker.com/" + testHash + "/cover.webp",
+	}})
+	require.NoError(t, err)
+
+	detailPayload, err := json.Marshal(mankoAPIMovie{
+		ID:     testHash,
+		Titles: []mankoAPILocalizedTitle{{Language: "en", Title: "IPZ-950"}, {Language: "ja", Title: "IPZ-950"}},
+		Descriptions: []mankoAPILocalizedText{
+			{Language: "en", Overview: "Attacker's Full Supervision Being Fucked In Front Of Her Husband - Kana Momonogi"},
+			{Language: "ja", Overview: "アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな"},
+		},
+		Tags:           []string{"Solowork", "Married Woman", "Training", "Rape", "Drama", "Digital Mosaic"},
+		Maker:          "IDEA POCKET",
+		Country:        "IDEA POCKET",
+		ReleaseDate:    "2017-05-24",
+		Rating:         "NA",
+		IMDbScore:      "4.55",
+		VideoDuration:  120,
+		ThumbnailImage: "https://image.healertanker.com/" + testHash + "/thumbs/xv/xve0n.jpg",
+		WideThumbnail:  "https://image.healertanker.com/" + testHash + "/cover.webp",
+		CoverImage:     "https://image.healertanker.com/" + testHash + "/cover.webp",
+		BackdropImages: []string{
+			"https://image.healertanker.com/" + testHash + "/samples/xv/xve0n_l_0.jpg",
+			"https://image.healertanker.com/" + testHash + "/samples/xv/xve0n_l_1.jpg",
+		},
+	})
+	require.NoError(t, err)
+
+	actorPayload, err := json.Marshal([]mankoAPIActor{
+		{
+			Name: "桃乃木香奈",
+			AlsoKnownAs: map[string]string{
+				"jp": "桃乃木かな",
+				"en": "Kana Momonogi",
+			},
+		},
+		{
+			Name:        "田淵正浩",
+			AlsoKnownAs: map[string]string{"jp": "田淵正浩", "en": "Masahiro Tabuchi"},
+		},
+	})
+	require.NoError(t, err)
+
+	m := newTestManko(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "ja-JP,ja;q=0.9", r.Header.Get("Accept-Language"))
+		assert.Contains(t, r.Header.Get("Referer"), "/ja/")
+		w.Header().Set("Content-Type", "application/json")
+
+		var payload []byte
+		switch {
+		case r.URL.Path == "/swx/movie/search":
+			assert.Equal(t, "IPZ-950", r.URL.Query().Get("keyword"))
+			payload = searchPayload
+		case r.URL.Path == "/swx/movie/detail/"+testHash:
+			payload = detailPayload
+		case r.URL.Path == "/swx/movie/actors/"+testHash:
+			payload = actorPayload
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(mankoAPIEnvelope{
+			Data: encodeMankoAPIData(payload),
+		}))
+	})
+
+	results, err := m.SearchMovie("IPZ-950")
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Equal(t, "IPZ-950", results[0].ID)
+	assert.Equal(t, "IPZ-950", results[0].Title)
+	assert.InDelta(t, 4.55, results[0].Score, 0.001)
+	assert.Equal(t, "2017-05-24", time.Time(results[0].ReleaseDate).Format("2006-01-02"))
+	assert.Equal(t, m.detailURL(testHash), results[0].Homepage)
+
+	info, err := m.GetMovieInfoByID("IPZ-950")
+	require.NoError(t, err)
+	require.True(t, info.IsValid())
+	assert.Equal(t, "IPZ-950", info.ID)
+	assert.Equal(t, "IPZ-950", info.Number)
+	assert.Equal(t, "アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな", info.Title)
+	assert.Equal(t, "アタッカーズ全面監修 夫の目の前で犯されて― 桃乃木かな", info.Summary)
+	assert.Equal(t, []string{"桃乃木かな", "田淵正浩"}, []string(info.Actors))
+	assert.Equal(t, "IDEA POCKET", info.Maker)
+	assert.Equal(t, 120, info.Runtime)
+	assert.InDelta(t, 4.55, info.Score, 0.001)
+	assert.Equal(t, "2017-05-24", time.Time(info.ReleaseDate).Format("2006-01-02"))
+	assert.Equal(t, []string{"Solowork", "Married Woman", "Training", "Rape", "Drama", "Digital Mosaic"}, []string(info.Genres))
+	assert.Equal(t, "https://image.healertanker.com/"+testHash+"/cover.webp", info.CoverURL)
+	assert.Equal(t, "https://image.healertanker.com/"+testHash+"/thumbs/xv/xve0n.jpg", info.ThumbURL)
+	assert.Equal(t, []string{
+		"https://image.healertanker.com/" + testHash + "/samples/xv/xve0n_l_0.jpg",
+		"https://image.healertanker.com/" + testHash + "/samples/xv/xve0n_l_1.jpg",
+	}, []string(info.PreviewImages))
+}
+
 func TestManko_SearchNoResults(t *testing.T) {
 	results, err := New().parseSearchResults(
 		[]byte(`<html><body><main><h1>Search Results</h1></main></body></html>`),
@@ -199,9 +361,11 @@ func TestManko_UsesFlareSolverrForSPAShell(t *testing.T) {
 	flare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1", r.URL.Path)
 		var payload struct {
-			URL string `json:"url"`
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers"`
 		}
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		assert.Equal(t, "ja-JP,ja;q=0.9", payload.Headers["Accept-Language"])
 
 		response := ""
 		switch {
@@ -237,7 +401,11 @@ func TestManko_UsesFlareSolverrForSPAShell(t *testing.T) {
 }
 
 func TestManko_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/swx/") {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Cf-Mitigated", "challenge")
 		w.WriteHeader(http.StatusForbidden)
 	}))
@@ -246,9 +414,11 @@ func TestManko_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {
 	flare := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1", r.URL.Path)
 		var payload struct {
-			URL string `json:"url"`
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers"`
 		}
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		assert.Equal(t, "ja-JP,ja;q=0.9", payload.Headers["Accept-Language"])
 
 		response := ""
 		switch {
@@ -270,13 +440,53 @@ func TestManko_UsesFlareSolverrForCloudflareChallenge(t *testing.T) {
 	t.Cleanup(flare.Close)
 
 	m := New()
-	m.Scraper = scraper.NewDefaultScraper(Name, target.URL+"/", Priority, language.English)
+	m.Scraper = scraper.NewDefaultScraper(Name, target.URL+"/", Priority, language.Japanese,
+		scraper.WithHeaders(map[string]string{
+			"Referer":         target.URL + "/",
+			"Accept-Language": "ja-JP,ja;q=0.9",
+		}))
+	m.apiHosts = []string{target.URL}
 	require.NoError(t, m.SetFlareSolverr(flare.URL+"/v1"))
 
 	info, err := m.GetMovieInfoByID("IPZ-950")
 	require.NoError(t, err)
 	assert.Equal(t, "IPZ-950", info.Number)
 	assert.Equal(t, testCover, info.CoverURL)
+}
+
+func encodeMankoAPIData(data []byte) string {
+	var (
+		out       strings.Builder
+		bitBuffer int
+		bitCount  int
+	)
+	out.Grow(len(data) * 5 / 4)
+	for _, value := range data {
+		bitBuffer |= int(value) << bitCount
+		bitCount += 8
+		if bitCount <= 13 {
+			continue
+		}
+
+		encoded := bitBuffer & 8191
+		if encoded > 88 {
+			bitBuffer >>= 13
+			bitCount -= 13
+		} else {
+			encoded = bitBuffer & 16383
+			bitBuffer >>= 14
+			bitCount -= 14
+		}
+		out.WriteByte(apiBase85Chars[encoded%91])
+		out.WriteByte(apiBase85Chars[encoded/91])
+	}
+	if bitCount > 0 {
+		out.WriteByte(apiBase85Chars[bitBuffer%91])
+		if bitCount > 7 || bitBuffer > 90 {
+			out.WriteByte(apiBase85Chars[bitBuffer/91])
+		}
+	}
+	return out.String()
 }
 
 func TestManko_LiveFlareSolverr(t *testing.T) {

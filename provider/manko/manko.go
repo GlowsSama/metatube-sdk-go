@@ -3,8 +3,10 @@ package manko
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -34,15 +36,18 @@ var (
 
 	hashIDRe            = regexp.MustCompile(`(?i)^[0-9a-f]{24}$`)
 	backgroundImageRe   = regexp.MustCompile(`(?i)background-image\s*:\s*url\(\s*['"]?([^'")]+)`)
+	apiHostRe           = regexp.MustCompile(`(?i)window\.(?:ip|ip2)\s*=\s*['"]([^'"]+)['"]`)
 	variantSuffixRe     = regexp.MustCompile(`(?i)(?:^|[-_\s])(?:uncensored(?:[-_\s]leak(?:ed)?)?|leak(?:ed)?|english[-_\s]subtitle|chinese[-_\s]subtitle|japanese[-_\s]subtitle|subtitle|sub)$`)
 	emptyAppShellRe     = regexp.MustCompile(`(?is)<div[^>]*\bid\s*=\s*["']app["'][^>]*>\s*</div>`)
 	errAntiBotChallenge = errors.New("Manko returned a Cloudflare challenge")
 )
 
 const (
-	Name     = "Manko"
-	Priority = 1000 - 21
-	baseURL  = "https://manko.fun/"
+	Name             = "Manko"
+	Priority         = 1000 - 21
+	baseURL          = "https://manko.fun/"
+	apiResponseLimit = 16 << 20
+	apiBase85Chars   = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&()*+,./:;<=>?@[]^_`{|}~\""
 )
 
 // Manko provides metadata from Manko's search and detail pages.
@@ -52,15 +57,56 @@ type Manko struct {
 
 	flareMu     sync.RWMutex
 	flareClient *flaresolverr.Client
+
+	apiMu    sync.RWMutex
+	apiHosts []string
+}
+
+type mankoAPIEnvelope struct {
+	Data string `json:"data"`
+}
+
+type mankoAPILocalizedTitle struct {
+	Language string `json:"language"`
+	Title    string `json:"title"`
+}
+
+type mankoAPILocalizedText struct {
+	Language string `json:"language"`
+	Overview string `json:"overview"`
+}
+
+type mankoAPIMovie struct {
+	ID               string                   `json:"_id"`
+	Title            string                   `json:"title"`
+	Titles           []mankoAPILocalizedTitle `json:"title_display_name"`
+	Descriptions     []mankoAPILocalizedText  `json:"discription"`
+	Tags             []string                 `json:"tags"`
+	Maker            string                   `json:"maker"`
+	Country          string                   `json:"country"`
+	ReleaseDate      string                   `json:"share_date"`
+	Rating           string                   `json:"rating"`
+	IMDbScore        string                   `json:"imdb_score"`
+	VideoDuration    int                      `json:"video_duration"`
+	ThumbnailImage   string                   `json:"thumbnail_image"`
+	WideThumbnail    string                   `json:"wide_thumbnail"`
+	CoverImage       string                   `json:"cover_image"`
+	BackdropImages   []string                 `json:"backdrop_images"`
+	PreviewImageURLS []string                 `json:"preview_images"`
+}
+
+type mankoAPIActor struct {
+	Name        string            `json:"name"`
+	AlsoKnownAs map[string]string `json:"also_known_as"`
 }
 
 func New() *Manko {
 	return &Manko{
 		Fetcher: fetch.Default(&fetch.Config{Referer: baseURL}),
-		Scraper: scraper.NewDefaultScraper(Name, baseURL, Priority, language.English,
+		Scraper: scraper.NewDefaultScraper(Name, baseURL, Priority, language.Japanese,
 			scraper.WithHeaders(map[string]string{
 				"Referer":         baseURL,
-				"Accept-Language": "en-US,en;q=0.9",
+				"Accept-Language": "ja-JP,ja;q=0.9",
 			}),
 		),
 	}
@@ -151,24 +197,329 @@ func (m *Manko) SearchMovie(keyword string) ([]*model.MovieSearchResult, error) 
 	if keyword == "" {
 		return nil, provider.ErrInvalidKeyword
 	}
+
+	apiResults, apiErr := m.searchAPIMovie(keyword)
+	if apiErr == nil {
+		return apiResults, nil
+	}
+
 	body, err := m.fetchPage(m.searchURL(keyword))
 	if err != nil {
 		return nil, err
 	}
-	return m.parseSearchResults(body, keyword)
+	results, err := m.parseSearchResults(body, keyword)
+	if err != nil && apiErr != nil {
+		return nil, fmt.Errorf("%s: API fallback failed: %v; page parser failed: %w", Name, apiErr, err)
+	}
+	return results, err
 }
 
 func (m *Manko) getMovieInfoByURL(rawURL, id string) (*model.MovieInfo, error) {
+	apiInfo, apiErr := m.getAPIMovieInfo(id, rawURL)
+	if apiErr == nil {
+		return apiInfo, nil
+	}
+
 	body, err := m.fetchPage(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	return m.parseMovieInfo(body, id, rawURL)
+	info, err := m.parseMovieInfo(body, id, rawURL)
+	if err != nil && apiErr != nil {
+		return nil, fmt.Errorf("%s: API fallback failed: %v; page parser failed: %w", Name, apiErr, err)
+	}
+	return info, err
+}
+
+func (m *Manko) searchAPIMovie(keyword string) ([]*model.MovieSearchResult, error) {
+	movies, err := m.fetchAPIMovies(keyword)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]*model.MovieSearchResult, 0)
+	seen := make(map[string]struct{})
+	for _, movie := range movies {
+		number := apiMovieNumber(movie)
+		if number == "" || !strings.EqualFold(number, keyword) || !hashIDRe.MatchString(movie.ID) {
+			continue
+		}
+		if _, exists := seen[number]; exists {
+			continue
+		}
+		seen[number] = struct{}{}
+
+		title := apiMovieTitle(movie, number)
+		if title == "" {
+			title = number
+		}
+		cover := m.absoluteURL(firstNonEmpty(
+			movie.WideThumbnail,
+			movie.CoverImage,
+			movie.ThumbnailImage,
+		))
+		result := &model.MovieSearchResult{
+			ID:          number,
+			Number:      number,
+			Title:       title,
+			Provider:    Name,
+			Homepage:    m.detailURL(movie.ID),
+			ThumbURL:    cover,
+			CoverURL:    cover,
+			Score:       apiMovieScore(movie),
+			ReleaseDate: parser.ParseDate(movie.ReleaseDate),
+		}
+		if result.IsValid() {
+			results = append(results, result)
+		}
+	}
+	if len(results) == 0 {
+		return nil, provider.ErrInfoNotFound
+	}
+	return results, nil
+}
+
+func (m *Manko) getAPIMovieInfo(id, homepage string) (*model.MovieInfo, error) {
+	movieID := id
+	if !hashIDRe.MatchString(movieID) {
+		movie, err := m.findAPIMovie(id)
+		if err != nil {
+			return nil, err
+		}
+		movieID = movie.ID
+	}
+	if !hashIDRe.MatchString(movieID) {
+		return nil, provider.ErrInfoNotFound
+	}
+
+	data, err := m.requestMankoAPI("/swx/movie/detail/"+url.PathEscape(movieID), nil)
+	if err != nil {
+		return nil, err
+	}
+	var movie mankoAPIMovie
+	if err := json.Unmarshal(data, &movie); err != nil {
+		return nil, fmt.Errorf("%s: decode API detail: %w", Name, err)
+	}
+	if movie.ID == "" {
+		movie.ID = movieID
+	}
+
+	number := apiMovieNumber(movie)
+	if number == "" {
+		number = javnumber.Normalize(id)
+	}
+	if number == "" {
+		number = javnumber.Find(firstNonEmpty(localizedAPITitle(movie), apiMovieSummary(movie)))
+	}
+	if number == "" {
+		return nil, provider.ErrInfoNotFound
+	}
+
+	title := apiMovieTitle(movie, number)
+	if title == "" {
+		title = number
+	}
+	if homepage == "" {
+		homepage = m.detailURL(movieID)
+	}
+
+	previews := make([]string, 0, len(movie.BackdropImages)+len(movie.PreviewImageURLS))
+	for _, rawURL := range append(append([]string(nil), movie.BackdropImages...), movie.PreviewImageURLS...) {
+		previews = appendUnique(previews, m.absoluteURL(rawURL))
+	}
+	genres := make([]string, 0, len(movie.Tags))
+	for _, genre := range movie.Tags {
+		genres = appendUnique(genres, genre)
+	}
+
+	cover := m.absoluteURL(firstNonEmpty(movie.CoverImage, movie.WideThumbnail, movie.ThumbnailImage))
+	thumb := m.absoluteURL(firstNonEmpty(movie.ThumbnailImage, movie.CoverImage, movie.WideThumbnail))
+	bigCover := m.absoluteURL(firstNonEmpty(movie.WideThumbnail, movie.CoverImage))
+	info := &model.MovieInfo{
+		ID:              number,
+		Number:          number,
+		Title:           title,
+		Summary:         apiMovieSummary(movie),
+		Provider:        Name,
+		Homepage:        homepage,
+		Actors:          []string{},
+		ThumbURL:        thumb,
+		BigThumbURL:     bigCover,
+		CoverURL:        cover,
+		BigCoverURL:     bigCover,
+		PreviewImages:   previews,
+		Maker:           firstNonEmpty(movie.Maker, movie.Country),
+		Genres:          genres,
+		Score:           apiMovieScore(movie),
+		Runtime:         movie.VideoDuration,
+		ReleaseDate:     parser.ParseDate(movie.ReleaseDate),
+		PreviewVideoURL: "",
+	}
+	if info.ThumbURL == "" {
+		info.ThumbURL = info.CoverURL
+	}
+	if info.CoverURL == "" && len(info.PreviewImages) > 0 {
+		info.CoverURL = info.PreviewImages[0]
+		info.ThumbURL = info.CoverURL
+	}
+
+	if data, actorErr := m.requestMankoAPI("/swx/movie/actors/"+url.PathEscape(movieID),
+		url.Values{"size": {"6"}, "page": {"1"}}); actorErr == nil {
+		var actors []mankoAPIActor
+		if json.Unmarshal(data, &actors) == nil {
+			names := make([]string, 0, len(actors))
+			for _, actor := range actors {
+				name := firstNonEmpty(
+					actor.AlsoKnownAs["jp"],
+					actor.AlsoKnownAs["ja"],
+					actor.Name,
+					actor.AlsoKnownAs["en"],
+				)
+				names = appendUnique(names, name)
+			}
+			info.Actors = names
+		}
+	}
+
+	if !info.IsValid() {
+		return nil, provider.ErrIncompleteMetadata
+	}
+	return info, nil
+}
+
+func (m *Manko) findAPIMovie(keyword string) (*mankoAPIMovie, error) {
+	keyword = m.NormalizeMovieKeyword(keyword)
+	if keyword == "" {
+		return nil, provider.ErrInvalidKeyword
+	}
+	movies, err := m.fetchAPIMovies(keyword)
+	if err != nil {
+		return nil, err
+	}
+	for i := range movies {
+		if strings.EqualFold(apiMovieNumber(movies[i]), keyword) && hashIDRe.MatchString(movies[i].ID) {
+			return &movies[i], nil
+		}
+	}
+	return nil, provider.ErrInfoNotFound
+}
+
+func (m *Manko) fetchAPIMovies(keyword string) ([]mankoAPIMovie, error) {
+	data, err := m.requestMankoAPI("/swx/movie/search", url.Values{
+		"keyword":   {keyword},
+		"size":      {"24"},
+		"page":      {"1"},
+		"can_manko": {"true"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var movies []mankoAPIMovie
+	if err := json.Unmarshal(data, &movies); err != nil {
+		return nil, fmt.Errorf("%s: decode API search: %w", Name, err)
+	}
+	return movies, nil
+}
+
+func (m *Manko) requestMankoAPI(path string, query url.Values) ([]byte, error) {
+	hosts := m.getAPIHosts()
+	var failures []string
+	for _, host := range hosts {
+		endpoint, err := mankoAPIEndpoint(host, path, query)
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		resp, err := m.Get(endpoint, fetch.WithHeaders(map[string]string{
+			"Accept":          "application/json, text/plain, */*",
+			"Accept-Language": "ja-JP,ja;q=0.9",
+			"Referer":         m.japaneseHomepage(),
+		}))
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, apiResponseLimit+1))
+		resp.Body.Close()
+		if readErr != nil {
+			failures = append(failures, readErr.Error())
+			continue
+		}
+		if len(body) > apiResponseLimit {
+			failures = append(failures, "response exceeds size limit")
+			continue
+		}
+
+		var envelope mankoAPIEnvelope
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		if strings.TrimSpace(envelope.Data) == "" {
+			failures = append(failures, "empty API payload")
+			continue
+		}
+		data, err := decodeMankoAPIData(envelope.Data)
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		return data, nil
+	}
+	if len(failures) == 0 {
+		failures = append(failures, "no API hosts available")
+	}
+	return nil, fmt.Errorf("%s: API request failed: %s", Name, strings.Join(failures, "; "))
+}
+
+func (m *Manko) getAPIHosts() []string {
+	m.apiMu.RLock()
+	hosts := append([]string(nil), m.apiHosts...)
+	m.apiMu.RUnlock()
+	if len(hosts) > 0 {
+		return hosts
+	}
+
+	var discovered []string
+	resp, err := m.Get(m.japaneseHomepage(), fetch.WithHeaders(map[string]string{
+		"Accept-Language": "ja-JP,ja;q=0.9",
+		"Referer":         m.URL().String(),
+	}))
+	if err == nil {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, apiResponseLimit+1))
+		resp.Body.Close()
+		if readErr == nil {
+			for _, match := range apiHostRe.FindAllSubmatch(body, -1) {
+				if host := normalizeMankoAPIHost(string(match[1])); host != "" {
+					discovered = appendUnique(discovered, host)
+				}
+			}
+		}
+	}
+	if len(discovered) == 0 {
+		discovered = []string{
+			"https://healertanker.com",
+			"https://alpharomeo.shop",
+		}
+	}
+
+	m.apiMu.Lock()
+	if len(m.apiHosts) == 0 {
+		m.apiHosts = append([]string(nil), discovered...)
+	} else {
+		discovered = append([]string(nil), m.apiHosts...)
+	}
+	m.apiMu.Unlock()
+	return discovered
+}
+
+func (m *Manko) japaneseHomepage() string {
+	return m.URL().ResolveReference(&url.URL{Path: "/ja/"}).String()
 }
 
 func (m *Manko) searchURL(keyword string) string {
 	return m.URL().ResolveReference(&url.URL{
-		Path: "/searchresult",
+		Path: "/ja/searchresult",
 		RawQuery: url.Values{
 			"by":      {"Title"},
 			"keyword": {keyword},
@@ -178,7 +529,7 @@ func (m *Manko) searchURL(keyword string) string {
 
 func (m *Manko) detailURL(id string) string {
 	return m.URL().ResolveReference(&url.URL{
-		Path: "/movie-info/" + id,
+		Path: "/ja/movie-info/" + id,
 	}).String()
 }
 
@@ -236,8 +587,8 @@ func (m *Manko) fetchRenderedPage(rawURL string) ([]byte, error) {
 	}
 
 	headers := make(http.Header)
-	headers.Set("Accept-Language", "en-US,en;q=0.9")
-	headers.Set("Referer", m.URL().String())
+	headers.Set("Accept-Language", "ja-JP,ja;q=0.9")
+	headers.Set("Referer", m.japaneseHomepage())
 	body, err := client.Get(context.Background(), rawURL, headers)
 	if err != nil {
 		return nil, fmt.Errorf("%s: render SPA page with FlareSolverr: %w", Name, err)
@@ -340,19 +691,21 @@ func (m *Manko) parseMovieInfo(body []byte, id, homepage string) (*model.MovieIn
 			value = firstText(row.Find("span").Eq(1))
 		}
 		switch strings.ToLower(label) {
-		case "title":
+		case "title", "タイトル":
 			if n := normalizeSearchNumber(value); n != "" {
 				info.Number = n
 			}
-		case "rating":
+		case "summary", "overview", "概要", "あらすじ":
+			info.Summary = value
+		case "rating", "評価", "评分":
 			info.Score = parser.ParseScore(value)
-		case "video duration":
+		case "video duration", "再生時間", "収録時間", "時間":
 			info.Runtime = parser.ParseRuntime(value)
-		case "maker":
+		case "maker", "メーカー", "メーカー名":
 			info.Maker = value
-		case "release date":
+		case "release date", "発売日", "配信日":
 			info.ReleaseDate = parser.ParseDate(value)
-		case "actor":
+		case "actor", "actors", "出演者", "出演":
 			row.Find("a[href*='/actor/']").Each(func(_ int, actor *goquery.Selection) {
 				info.Actors = appendUnique(info.Actors, trimFact(actor.Text()))
 			})
@@ -379,6 +732,10 @@ func (m *Manko) parseMovieInfo(body []byte, id, homepage string) (*model.MovieIn
 		}
 		return true
 	})
+	if info.CoverURL == "" && len(info.PreviewImages) > 0 {
+		info.CoverURL = info.PreviewImages[0]
+		info.ThumbURL = info.CoverURL
+	}
 
 	if info.Number == "" {
 		info.Number = javnumber.Find(info.Title)
@@ -396,6 +753,169 @@ func (m *Manko) parseMovieInfo(body []byte, id, homepage string) (*model.MovieIn
 		return nil, provider.ErrIncompleteMetadata
 	}
 	return info, nil
+}
+
+func decodeMankoAPIData(encoded string) ([]byte, error) {
+	var (
+		accumulator uint32
+		bits        uint
+		queue       = -1
+		decoded     = make([]byte, 0, len(encoded))
+	)
+	for i := 0; i < len(encoded); i++ {
+		value := strings.IndexByte(apiBase85Chars, encoded[i])
+		if value < 0 {
+			continue
+		}
+		if queue < 0 {
+			queue = value
+			continue
+		}
+
+		queue += 91 * value
+		accumulator |= uint32(queue) << bits
+		if queue&8191 > 88 {
+			bits += 13
+		} else {
+			bits += 14
+		}
+		for bits > 7 {
+			decoded = append(decoded, byte(accumulator))
+			accumulator >>= 8
+			bits -= 8
+		}
+		queue = -1
+	}
+	if queue > -1 {
+		decoded = append(decoded, byte(accumulator|uint32(queue)<<bits))
+	}
+	if len(decoded) == 0 {
+		return nil, fmt.Errorf("%s: empty API payload after decoding", Name)
+	}
+	return decoded, nil
+}
+
+func mankoAPIEndpoint(host, path string, query url.Values) (string, error) {
+	base, err := url.Parse(host)
+	if err != nil {
+		return "", fmt.Errorf("parse Manko API host: %w", err)
+	}
+	if base.Scheme != "http" && base.Scheme != "https" {
+		return "", fmt.Errorf("invalid Manko API host scheme %q", base.Scheme)
+	}
+	if base.Hostname() == "" {
+		return "", fmt.Errorf("invalid Manko API host %q", host)
+	}
+	base.Path = path
+	base.RawPath = ""
+	base.RawQuery = query.Encode()
+	base.Fragment = ""
+	return base.String(), nil
+}
+
+func normalizeMankoAPIHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		if strings.ContainsAny(raw, "/?#") {
+			return ""
+		}
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+func apiMovieNumber(movie mankoAPIMovie) string {
+	for _, candidate := range apiMovieTitleCandidates(movie) {
+		if number := normalizeSearchNumber(candidate); number != "" {
+			return number
+		}
+	}
+	return ""
+}
+
+func apiMovieTitleCandidates(movie mankoAPIMovie) []string {
+	candidates := make([]string, 0, len(movie.Titles)+1)
+	if movie.Title != "" {
+		candidates = append(candidates, movie.Title)
+	}
+	for _, title := range movie.Titles {
+		if title.Title != "" {
+			candidates = append(candidates, title.Title)
+		}
+	}
+	return candidates
+}
+
+func localizedAPITitle(movie mankoAPIMovie) string {
+	for _, wanted := range []string{"ja", "en"} {
+		for _, title := range movie.Titles {
+			if strings.EqualFold(title.Language, wanted) && strings.TrimSpace(title.Title) != "" {
+				return cleanText(title.Title)
+			}
+		}
+	}
+	for _, title := range movie.Titles {
+		if strings.TrimSpace(title.Title) != "" {
+			return cleanText(title.Title)
+		}
+	}
+	return cleanText(movie.Title)
+}
+
+func localizedAPIDescription(movie mankoAPIMovie) string {
+	for _, wanted := range []string{"ja", "en"} {
+		for _, description := range movie.Descriptions {
+			if strings.EqualFold(description.Language, wanted) &&
+				strings.TrimSpace(description.Overview) != "" {
+				return cleanText(description.Overview)
+			}
+		}
+	}
+	for _, description := range movie.Descriptions {
+		if strings.TrimSpace(description.Overview) != "" {
+			return cleanText(description.Overview)
+		}
+	}
+	return ""
+}
+
+func apiMovieTitle(movie mankoAPIMovie, number string) string {
+	title := localizedAPITitle(movie)
+	description := localizedAPIDescription(movie)
+	if title == "" {
+		title = description
+	} else if description != "" &&
+		!strings.Contains(strings.ToLower(title), strings.ToLower(description)) {
+		title = strings.TrimSpace(title + " " + description)
+	}
+	return javnumber.CleanTitle(title, number)
+}
+
+func apiMovieSummary(movie mankoAPIMovie) string {
+	return localizedAPIDescription(movie)
+}
+
+func apiMovieScore(movie mankoAPIMovie) float64 {
+	if score := parser.ParseScore(movie.IMDbScore); score > 0 {
+		return score
+	}
+	return parser.ParseScore(movie.Rating)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (m *Manko) isSiteHost(host string) bool {
