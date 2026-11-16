@@ -168,12 +168,70 @@ func TestFANZA_FilterSearchResults(t *testing.T) {
 
 func TestFANZA_FilterSearchResultsNoExactMatch(t *testing.T) {
 	results := []*model.MovieSearchResult{
-		{ID: "ipz00371", Number: "IPZ-371"},
-		{ID: "ipz00373", Number: "IPZ-373"},
-		{ID: "ipz00374", Number: "IPZ-374"},
+		{
+			ID:       "ipz00371",
+			Number:   "IPZ-371",
+			Title:    "Related result",
+			Provider: Name,
+			Homepage: baseURL + "digital/videoa/-/detail/=/cid=ipz00371/",
+		},
+		{
+			ID:       "ipz00373",
+			Number:   "IPZ-373",
+			Title:    "Related result",
+			Provider: Name,
+			Homepage: baseURL + "digital/videoa/-/detail/=/cid=ipz00373/",
+		},
+		{
+			ID:       "ipz00374",
+			Number:   "IPZ-374",
+			Title:    "Related result",
+			Provider: Name,
+			Homepage: baseURL + "digital/videoa/-/detail/=/cid=ipz00374/",
+		},
 	}
 
 	assert.Empty(t, New().filterSearchResults(results, "IPZ-037"))
+}
+
+func TestFANZA_FilterSearchResultsUsesContentIDAndHomepage(t *testing.T) {
+	results := []*model.MovieSearchResult{
+		{
+			ID:       "ipz00371",
+			Title:    "Related result",
+			Provider: Name,
+			Homepage: "https://video.dmm.co.jp/av/content/?id=ipz00371",
+		},
+		{
+			ID:       "ipz00037",
+			Title:    "Exact result by content ID",
+			Provider: Name,
+			Homepage: "https://video.dmm.co.jp/av/content/?id=ipz00037",
+		},
+		{
+			Title:    "Exact result by homepage",
+			Provider: Name,
+			Homepage: baseURL + "digital/videoa/-/detail/=/cid=ipz00037/",
+		},
+	}
+
+	filtered := New().filterSearchResults(results, "IPZ-037")
+	require.Len(t, filtered, 2)
+	assert.Equal(t, "Exact result by content ID", filtered[0].Title)
+	assert.Equal(t, "Exact result by homepage", filtered[1].Title)
+}
+
+func TestFANZA_FilterSearchResultsDeduplicatesMissingFields(t *testing.T) {
+	result := &model.MovieSearchResult{
+		Number:   "IPZ-037",
+		Title:    "Exact result",
+		Provider: Name,
+	}
+	results := []*model.MovieSearchResult{result, result}
+
+	filtered := New().filterSearchResults(results, "IPZ-037")
+	require.Len(t, filtered, 1)
+	assert.Same(t, result, filtered[0])
 }
 
 func TestFANZA_FilterSearchResultsKeepsKeywordSearch(t *testing.T) {

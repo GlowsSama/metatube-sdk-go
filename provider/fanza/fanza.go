@@ -66,6 +66,7 @@ const regionNotAvailable = "not-available-in-your-region"
 var (
 	errContentIDNotFound = errors.New("content-id-not-found")
 	errRequireNewHandler = errors.New("require-new-handler")
+	fanzaCIDPathRe       = regexp.MustCompile(`/cid=([^/?]+)`)
 
 	ErrRegionNotAvailable = errors.New(regionNotAvailable)
 )
@@ -772,13 +773,10 @@ func (fz *FANZA) filterSearchResults(results []*model.MovieSearchResult, keyword
 	filtered := make([]*model.MovieSearchResult, 0, len(results))
 	seen := make(map[string]struct{}, len(results))
 	for _, result := range results {
-		if result == nil || normalizeNumberKey(result.Number) != target {
+		if result == nil || !searchResultMatchesNumber(result, target) {
 			continue
 		}
-		key := result.ID
-		if key == "" {
-			key = result.Homepage
-		}
+		key := result.Provider + "\x00" + result.ID + "\x00" + result.Homepage
 		if _, exists := seen[key]; exists {
 			continue
 		}
@@ -786,6 +784,33 @@ func (fz *FANZA) filterSearchResults(results []*model.MovieSearchResult, keyword
 		filtered = append(filtered, result)
 	}
 	return filtered
+}
+
+func searchResultMatchesNumber(result *model.MovieSearchResult, target string) bool {
+	for _, candidate := range []string{
+		result.Number,
+		result.ID,
+		fanzaIDFromURL(result.Homepage),
+	} {
+		if normalizeNumberKey(candidate) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func fanzaIDFromURL(rawURL string) string {
+	homepage, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	if id := homepage.Query().Get("id"); id != "" {
+		return id
+	}
+	if sub := fanzaCIDPathRe.FindStringSubmatch(homepage.Path); len(sub) == 2 {
+		return sub[1]
+	}
+	return ""
 }
 
 func normalizeNumberKey(value string) string {
