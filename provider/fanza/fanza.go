@@ -31,6 +31,7 @@ import (
 	"github.com/metatube-community/metatube-sdk-go/provider/fanza/internal/graphql"
 	"github.com/metatube-community/metatube-sdk-go/provider/fanza/internal/searchparse"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/imcmp"
+	"github.com/metatube-community/metatube-sdk-go/provider/internal/javnumber"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/scraper"
 )
 
@@ -605,12 +606,17 @@ func (fz *FANZA) SearchMovie(keyword string) ([]*model.MovieSearchResult, error)
 		if errors.Is(err, ErrRegionNotAvailable) {
 			return nil, err // no need to retry, the whole site is restricted.
 		}
+		results = fz.filterSearchResults(results, keyword)
 		if err == nil && len(results) > 0 {
 			return results, nil
 		}
 	}
 	// fallback to normal dvd search.
-	return fz.searchMovieNext(strings.Replace(keyword, "-", "", 1))
+	results, err := fz.searchMovieNext(strings.Replace(keyword, "-", "", 1))
+	if err != nil {
+		return nil, err
+	}
+	return fz.filterSearchResults(results, keyword), nil
 }
 
 func (fz *FANZA) searchMovieNext(keyword string) (results []*model.MovieSearchResult, err error) {
@@ -755,6 +761,44 @@ func (fz *FANZA) sortMovieSearchResults(keyword string, results []*model.MovieSe
 		}
 		return comparer.Compare(a, x) >= comparer.Compare(b, x)
 	})
+}
+
+func (fz *FANZA) filterSearchResults(results []*model.MovieSearchResult, keyword string) []*model.MovieSearchResult {
+	target := normalizeNumberKey(keyword)
+	if target == "" {
+		return results
+	}
+
+	filtered := make([]*model.MovieSearchResult, 0, len(results))
+	seen := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		if result == nil || normalizeNumberKey(result.Number) != target {
+			continue
+		}
+		key := result.ID
+		if key == "" {
+			key = result.Homepage
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		filtered = append(filtered, result)
+	}
+	return filtered
+}
+
+func normalizeNumberKey(value string) string {
+	normalized := javnumber.Normalize(value)
+	parts := strings.SplitN(normalized, "-", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return normalized
+	}
+	parts[1] = strings.TrimLeft(parts[1], "0")
+	if parts[1] == "" {
+		parts[1] = "0"
+	}
+	return parts[0] + "-" + parts[1]
 }
 
 func (fz *FANZA) GetMovieReviewsByID(id string) (reviews []*model.MovieReviewDetail, err error) {

@@ -4,7 +4,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/metatube-community/metatube-sdk-go/model"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/testkit"
 )
 
@@ -123,6 +125,64 @@ func TestFANZA_SearchMovie(t *testing.T) {
 		"HMN-686",
 		"START-285",
 	})
+}
+
+func TestFANZA_FilterSearchResults(t *testing.T) {
+	results := []*model.MovieSearchResult{
+		{
+			ID:       "ipz00371",
+			Number:   "IPZ-371",
+			Title:    "Related result",
+			Provider: Name,
+			Homepage: baseURL + "digital/videoa/-/detail/=/cid=ipz00371/",
+		},
+		{
+			ID:       "ipz00037",
+			Number:   "IPZ-037",
+			Title:    "Exact result",
+			Provider: Name,
+			Homepage: baseURL + "digital/videoa/-/detail/=/cid=ipz00037/",
+		},
+		{
+			ID:       "ipz00037",
+			Number:   "IPZ-037",
+			Title:    "Duplicate result",
+			Provider: Name,
+			Homepage: baseURL + "digital/videoa/-/detail/=/cid=ipz00037/",
+		},
+		{
+			ID:       "ipzz00037",
+			Number:   "IPZZ-037",
+			Title:    "Different label",
+			Provider: Name,
+			Homepage: baseURL + "digital/videoa/-/detail/=/cid=ipzz00037/",
+		},
+		nil,
+	}
+
+	filtered := New().filterSearchResults(results, "ipz-37")
+	require.Len(t, filtered, 1)
+	assert.Equal(t, "IPZ-037", filtered[0].Number)
+	assert.Equal(t, "Exact result", filtered[0].Title)
+}
+
+func TestFANZA_FilterSearchResultsNoExactMatch(t *testing.T) {
+	results := []*model.MovieSearchResult{
+		{ID: "ipz00371", Number: "IPZ-371"},
+		{ID: "ipz00373", Number: "IPZ-373"},
+		{ID: "ipz00374", Number: "IPZ-374"},
+	}
+
+	assert.Empty(t, New().filterSearchResults(results, "IPZ-037"))
+}
+
+func TestFANZA_FilterSearchResultsKeepsKeywordSearch(t *testing.T) {
+	results := []*model.MovieSearchResult{
+		{ID: "result-1", Number: "IPZ-371"},
+		{ID: "result-2", Number: "IPZ-373"},
+	}
+
+	assert.Equal(t, results, New().filterSearchResults(results, "桃乃木かな"))
 }
 
 func TestFANZA_GetMovieReviewsByURL(t *testing.T) {
